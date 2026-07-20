@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+# Machine-local configuration and credentials
+config.json
+lan-worker.json
+
+# Runtime and private audit data
+data/*
+captures/*
+hashes/*
+wordlists/*
+rules/*
+logs/*
+sessions/*
+
+# Downloaded runtimes; keep only the tiny licensed bootstrap extractor
+tools/*
+!tools/bootstrap/
+tools/bootstrap/*
+!tools/bootstrap/7zr.exe
+!tools/bootstrap/7zip-license.txt
+
+# Generated packages and local browser output
+dist/
+*.zip
+*.log

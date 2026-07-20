@@ -1,0 +1,12 @@
+{
+  "coordinator_url": "http://192.168.1.10:8787",
+  "token": "PASTE_TOKEN_FROM_SETTINGS",
+  "worker_name": "gaming-pc-2",
+  "hashcat_path": "",
+  "force_opencl": false,
+  "wordlist_roots": [
+    "C:/HandshakeWordlists",
+    "//MAIN-PC/HandshakeWordlists"
+  ],
+  "poll_seconds": 3
+}
