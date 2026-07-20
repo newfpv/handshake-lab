@@ -129,6 +129,10 @@ def main():
         for control_id in ("testAllNotifications", "runBenchmark", "telegramFileIntake", "remoteAccessEnabled", "checkPublicAddress"):
             if not driver.find_element("id", control_id).is_displayed():
                 raise AssertionError(f"Settings control is missing: {control_id}")
+        driver.execute_script("for(const id of ['telegramNotifications','remoteAccessEnabled']){const input=document.getElementById(id);input.checked=true;input.dispatchEvent(new Event('change',{bubbles:true}))}")
+        preserved = driver.execute_async_script("const done=arguments[0];setTimeout(()=>done(['telegramNotifications','remoteAccessEnabled'].every(id=>document.getElementById(id).checked)),3500)")
+        if not preserved:
+            raise AssertionError("Background refresh overwrote unsaved settings")
         errors = [entry for entry in driver.get_log("browser") if entry["level"] == "SEVERE"]
         if errors:
             raise AssertionError(f"Browser console errors: {errors}")

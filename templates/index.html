@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#070809">
   <title>Handshake Lab // NewFPV</title>
-  <link rel="icon" href="{{ url_for('static', filename='favicon.svg', v='1.2.1') }}" type="image/svg+xml">
-  <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v='1.2.1') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='extras.css', v='1.2.1') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='release.css', v='1.2.1') }}">
+  <link rel="icon" href="{{ url_for('static', filename='favicon.svg', v='1.2.2') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v='1.2.2') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='extras.css', v='1.2.2') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='release.css', v='1.2.2') }}">
 </head>
 <body>
   <svg class="svg-sprite" aria-hidden="true">
@@ -315,7 +315,7 @@
     <form method="dialog" id="cascadeDedupForm"><header><div><span class="eyebrow">SOURCE OPTIMIZATION</span><h2>Cascade deduplication</h2></div><button class="icon-button" value="cancel" aria-label="Close">&times;</button></header><p>This process will read all dictionary files in their current order and create new optimized files (prefix: unique_) to prevent duplicate work. This may take a few minutes and requires sufficient RAM. Proceed?</p><div class="dedup-order" id="dedupOrder"></div><div class="wiki-note"><b>Originals remain safe</b><span>The connected entries switch to the optimized copies, while original files remain untouched on disk. Rule files are ignored.</span></div><div class="verify-result" id="cascadeResult" hidden></div><div class="dialog-actions"><button class="button" id="cancelCascadeDedup" value="cancel">Cancel</button><button class="button primary" id="runCascadeDedup" value="default"><svg><use href="#i-layers"/></svg><span>Proceed</span></button></div></form>
   </dialog>
   <div class="toast-stack" id="toasts"></div>
-  <script src="{{ url_for('static', filename='newfpv-credit.js', v='1.2.1') }}"></script>
-  <script src="{{ url_for('static', filename='app.js', v='1.2.1') }}"></script>
+  <script src="{{ url_for('static', filename='newfpv-credit.js', v='1.2.2') }}"></script>
+  <script src="{{ url_for('static', filename='app.js', v='1.2.2') }}"></script>
 </body>
 </html>

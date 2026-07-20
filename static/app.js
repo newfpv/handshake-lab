@@ -71,6 +71,7 @@ function selectedPlanEstimate(captureCount, strategyIds){
 }
 
 let state = {captures:[],wordlists:[],strategies:[],presets:[],jobs:[],results:[],events:[],telemetry:[],gpu:{},tools:{},config:{}};
+let settingsDirty = false;
 let activePage = location.hash.slice(1) || 'dashboard';
 let selectedCaptures = new Set();
 let queueCaptureSelection = null;
@@ -527,35 +528,44 @@ function renderEvents(){
 }
 
 function renderSettings(){
-  $('#hashcatPath').value = state.config.hashcat_path || '';
-  $('#hcxPath').value = state.config.hcxpcapngtool_path || '';
-  $('#hostSetting').value = state.config.host || '127.0.0.1';
-  $('#portSetting').value = state.config.port || 8787;
-  $('#workerSetting').value = state.config.max_workers || 1;
-  $('#workloadSetting').value = state.config.workload_profile || 3;
-  $('#temperatureSetting').value = state.config.temperature_abort || 90;
-  $('#lanEnabled').checked = Boolean(state.config.lan_enabled);
-  $('#lanToken').value = state.config.lan_token || '';
-  $('#lanTimeout').value = state.config.lan_job_timeout || 180;
-  $('#windowsNotifications').checked = Boolean(state.config.notifications_windows);
-  $('#telegramNotifications').checked = Boolean(state.config.notifications_telegram);
-  $('#telegramBotToken').value = state.config.telegram_bot_token || '';
-  $('#telegramChatId').value = state.config.telegram_chat_id || '';
-  $('#telegramFileIntake').checked = Boolean(state.config.telegram_file_intake);
-  $('#notifyPassword').checked = state.config.notify_password_found !== false;
-  $('#notifyOverheat').checked = state.config.notify_overheat !== false;
-  $('#notifyWorker').checked = state.config.notify_worker_error !== false;
-  $('#notifyQueue').checked = state.config.notify_queue_complete !== false;
-  $('#telegramBotToken').disabled=!$('#telegramNotifications').checked;
-  $('#telegramChatId').disabled=!$('#telegramNotifications').checked;
-  $('#telegramFileIntake').disabled=!$('#telegramNotifications').checked;
-  $('#remoteAccessEnabled').checked=Boolean(state.config.remote_access_enabled);
-  $('#remoteUsername').value=state.config.remote_username||'newfpv';
-  $('#remotePassword').placeholder=state.config.remote_password_configured?'Configured · enter only to replace':'At least 12 characters';
+  if(!settingsDirty){
+    $('#hashcatPath').value = state.config.hashcat_path || '';
+    $('#hcxPath').value = state.config.hcxpcapngtool_path || '';
+    $('#hostSetting').value = state.config.host || '127.0.0.1';
+    $('#portSetting').value = state.config.port || 8787;
+    $('#workerSetting').value = state.config.max_workers || 1;
+    $('#workloadSetting').value = state.config.workload_profile || 3;
+    $('#temperatureSetting').value = state.config.temperature_abort || 90;
+    $('#lanEnabled').checked = Boolean(state.config.lan_enabled);
+    $('#lanToken').value = state.config.lan_token || '';
+    $('#lanTimeout').value = state.config.lan_job_timeout || 180;
+    $('#windowsNotifications').checked = Boolean(state.config.notifications_windows);
+    $('#telegramNotifications').checked = Boolean(state.config.notifications_telegram);
+    $('#telegramBotToken').value = state.config.telegram_bot_token || '';
+    $('#telegramChatId').value = state.config.telegram_chat_id || '';
+    $('#telegramFileIntake').checked = Boolean(state.config.telegram_file_intake);
+    $('#notifyPassword').checked = state.config.notify_password_found !== false;
+    $('#notifyOverheat').checked = state.config.notify_overheat !== false;
+    $('#notifyWorker').checked = state.config.notify_worker_error !== false;
+    $('#notifyQueue').checked = state.config.notify_queue_complete !== false;
+    $('#telegramBotToken').disabled=!$('#telegramNotifications').checked;
+    $('#telegramChatId').disabled=!$('#telegramNotifications').checked;
+    $('#telegramFileIntake').disabled=!$('#telegramNotifications').checked;
+    $('#remoteAccessEnabled').checked=Boolean(state.config.remote_access_enabled);
+    $('#remoteUsername').value=state.config.remote_username||'newfpv';
+    $('#remotePassword').placeholder=state.config.remote_password_configured?'Configured · enter only to replace':'At least 12 characters';
+  }
   const workers=onlineLanWorkers();
   const workerList=$('#lanWorkerList');
   workerList.hidden=!workers.length;
   workerList.innerHTML=workers.map(worker=>{const caps=worker.telemetry?.capabilities||{};return `<article><i class="${esc(worker.status)}"></i><span><b>${esc(worker.name)}</b><small>${esc(worker.gpu_name||'GPU worker')} · ${caps.cpu_available?'CPU ready':'GPU only'} · ${esc(worker.status)} · ${fmtDate(worker.last_seen)}</small></span><em>${worker.current_job_id?`Job #${worker.current_job_id}`:'Idle'}</em></article>`}).join('');
+}
+
+function markSettingsDirty(){
+  settingsDirty=true;
+  const button=$('#saveSettings');
+  button.classList.add('settings-dirty');
+  button.innerHTML=`${icon('check')}Save changes`;
 }
 
 function renderBenchmark(result){
@@ -1108,13 +1118,23 @@ $('#startQueue').onclick = async () => {
 };
 
 $('#saveSettings').onclick = async () => {
+  const button=$('#saveSettings');
   const payload = {hashcat_path:$('#hashcatPath').value.trim(),hcxpcapngtool_path:$('#hcxPath').value.trim(),host:$('#hostSetting').value.trim(),port:Number($('#portSetting').value),max_workers:Number($('#workerSetting').value),workload_profile:Number($('#workloadSetting').value),temperature_abort:Number($('#temperatureSetting').value),lan_enabled:$('#lanEnabled').checked,lan_token:$('#lanToken').value.trim(),lan_job_timeout:Number($('#lanTimeout').value),notifications_windows:$('#windowsNotifications').checked,notifications_telegram:$('#telegramNotifications').checked,telegram_bot_token:$('#telegramBotToken').value.trim(),telegram_chat_id:$('#telegramChatId').value.trim(),telegram_file_intake:$('#telegramFileIntake').checked,notify_password_found:$('#notifyPassword').checked,notify_overheat:$('#notifyOverheat').checked,notify_worker_error:$('#notifyWorker').checked,notify_queue_complete:$('#notifyQueue').checked,remote_access_enabled:$('#remoteAccessEnabled').checked,remote_username:$('#remoteUsername').value.trim(),remote_password:$('#remotePassword').value};
-  try{ await api('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); toast('Settings saved. Restart the app if host or port changed.'); await refresh(); }catch(error){toast(error.message,true)}
+  button.disabled=true;
+  try{
+    const result=await api('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    settingsDirty=false;state.config=result.config;$('#remotePassword').value='';
+    button.classList.remove('settings-dirty');button.innerHTML=`${icon('check')}Save`;
+    renderSettings();toast('Settings saved. Restart the app if host or port changed.');await refresh();
+  }catch(error){toast(error.message,true)}finally{button.disabled=false}
 };
 
 $('#runDoctor').onclick=event=>runDoctor(event.currentTarget);
 $('#doctorFixAll').onclick=event=>applyDoctor('all',event.currentTarget);
 $('#telegramNotifications').onchange=event=>{$('#telegramBotToken').disabled=!event.target.checked;$('#telegramChatId').disabled=!event.target.checked;$('#telegramFileIntake').disabled=!event.target.checked};
+const settingsPage=$('[data-page="settings"]');
+settingsPage.addEventListener('input',event=>{if(event.target.matches('input,select'))markSettingsDirty()});
+settingsPage.addEventListener('change',event=>{if(event.target.matches('input,select'))markSettingsDirty()});
 $('#testWindowsNotification').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{await api('/api/notifications/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'windows'})});toast('Windows test notification sent')}catch(error){toast(error.message,true)}finally{button.disabled=false}};
 $('#testTelegramNotification').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{await api('/api/notifications/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'telegram'})});toast('Telegram test message sent')}catch(error){toast(error.message,true)}finally{button.disabled=false}};
 $('#testAllNotifications').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{const result=await api('/api/notifications/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'all'})});toast(`Test sent: ${result.sent.join(' + ')}`)}catch(error){toast(error.message,true)}finally{button.disabled=false}};

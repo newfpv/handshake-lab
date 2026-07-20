@@ -2,6 +2,12 @@
 
 All notable changes to NewFPV Handshake Lab are documented here.
 
+## 1.2.2 — 2026-07-20
+
+- Prevented the three-second dashboard refresh from overwriting unsaved Settings fields and checkboxes.
+- Added an explicit highlighted Save changes state while configuration edits are pending.
+- Kept invalid Remote Web and Telegram drafts visible so validation errors can be corrected without re-entering the form.
+
 ## 1.2.1 — 2026-07-20
 
 - Added a registered native Windows notification identity with a compact Handshake Lab logo.

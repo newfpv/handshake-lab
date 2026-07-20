@@ -1,6 +1,6 @@
 # Handshake Lab
 
-![Release](https://img.shields.io/badge/release-1.2.1-20e4f4?style=flat-square)
+![Release](https://img.shields.io/badge/release-1.2.2-20e4f4?style=flat-square)
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-20e4f4?style=flat-square)
 ![Local first](https://img.shields.io/badge/data-local%20only-30e37b?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-f4f6f7?style=flat-square)
