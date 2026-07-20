@@ -232,6 +232,46 @@ class AuditAppTests(unittest.TestCase):
         self.assertEqual(telemetry["memory_total"], 8192)
         self.assertIn("sampled_at", telemetry)
 
+    def test_missing_lan_source_requeues_job_and_pauses_worker(self):
+        self.client.put("/api/config", json={"lan_enabled": True, "lan_token": "test-lan-token"})
+        capture_path = Path(self.temp.name) / "lan-source.22000"
+        capture_path.write_text(SAMPLE, encoding="utf-8")
+        with audit.db() as connection:
+            capture_id = connection.execute(
+                """INSERT INTO captures(filename,stored_path,hash_path,kind,networks,status,sha256,imported_at)
+                   VALUES('lan-source.22000',?,?,'22000',1,'ready','lan-source-sha',?)""",
+                (str(capture_path), str(capture_path), audit.now()),
+            ).lastrowid
+            strategy_id = connection.execute("SELECT id FROM strategies WHERE mode='dictionary' LIMIT 1").fetchone()[0]
+            job_id = connection.execute(
+                """INSERT INTO jobs(capture_id,strategy_id,status,session_name,created_at,worker_name)
+                   VALUES(?,?,'lan_preparing','lan-source-test',?,'pc-2')""",
+                (capture_id, strategy_id, audit.now()),
+            ).lastrowid
+            connection.execute(
+                """INSERT INTO lan_workers(name,status,current_job_id,last_seen,created_at)
+                   VALUES('pc-2','running',?,?,?)""",
+                (job_id, audit.now(), audit.now()),
+            )
+        response = self.client.post(
+            f"/api/lan/jobs/{job_id}/complete",
+            json={
+                "name": "pc-2", "exit_code": 2, "outfile": "",
+                "log": "Worker preparation failed: Source not found on worker: huge.txt (123 bytes)",
+            },
+            headers={"Authorization": "Bearer test-lan-token"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["deferred"])
+        with audit.db() as connection:
+            job = connection.execute("SELECT status,worker_name,finished_at,error FROM jobs WHERE id=?", (job_id,)).fetchone()
+            worker = connection.execute("SELECT paused,status,current_job_id FROM lan_workers WHERE name='pc-2'").fetchone()
+        self.assertEqual(job["status"], "queued")
+        self.assertEqual(job["worker_name"], "")
+        self.assertIsNone(job["finished_at"])
+        self.assertIn("Source not found", job["error"])
+        self.assertEqual(tuple(worker), (1, "idle", None))
+
     def test_retry_resets_failed_lan_job_without_stale_worker_state(self):
         capture_path = Path(self.temp.name) / "retry.22000"
         capture_path.write_text(SAMPLE, encoding="utf-8")
@@ -282,6 +322,18 @@ class AuditAppTests(unittest.TestCase):
         self.assertEqual(row["started_at"], "2026-07-20T10:00:00+00:00")
         self.assertIsNone(row["active_started_at"])
         self.assertEqual(row["elapsed_seconds"], 18)
+
+    def test_queue_method_detail_names_sources_masks_and_rules(self):
+        sources = {
+            7: {"filename": "weakpass.txt"},
+            8: {"filename": "best64.rule"},
+        }
+        dictionary = audit.strategy_method_detail({"mode": "dictionary", "config": {"wordlist_id": 7}}, sources)
+        rules = audit.strategy_method_detail({"mode": "rules", "config": {"wordlist_id": 7, "rule_id": 8}}, sources)
+        mask = audit.strategy_method_detail({"mode": "mask", "config": {"mask": "?d?d?d?d?d?d?d?d", "increment": True}}, sources)
+        self.assertEqual(dictionary, "Dictionary · weakpass.txt")
+        self.assertIn("weakpass.txt · Rule · best64.rule", rules)
+        self.assertEqual(mask, "Mask · ?d?d?d?d?d?d?d?d · Increment enabled")
 
     def test_os_level_process_pause_and_resume(self):
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])

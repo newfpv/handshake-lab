@@ -16,11 +16,15 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-WORKER_VERSION = "1.3.1"
+WORKER_VERSION = "1.3.2"
 CONFIG_PATH = ROOT / "lan-worker.json"
 RUNTIME = ROOT / "data" / "lan-worker"
 RUNTIME.mkdir(parents=True, exist_ok=True)
 INSTANCE_HANDLE = None
+
+
+class MissingSourceError(RuntimeError):
+    pass
 
 
 def acquire_single_instance(worker_name: str) -> None:
@@ -168,7 +172,7 @@ def find_source(config: dict, expected: dict) -> Path:
     for path in candidates:
         if path.stat().st_size == int(expected.get("bytes") or -1) and portable_fingerprint(path) == expected["fingerprint"]:
             return path
-    raise RuntimeError(f"Source not found on worker: {expected['filename']} ({expected.get('bytes', 0)} bytes)")
+    raise MissingSourceError(f"Source not found on worker: {expected['filename']} ({expected.get('bytes', 0)} bytes)")
 
 
 def flatten_numbers(value) -> list[float]:
@@ -176,6 +180,15 @@ def flatten_numbers(value) -> list[float]:
     if isinstance(value, dict): return sum((flatten_numbers(item) for item in value.values()), [])
     if isinstance(value, list): return sum((flatten_numbers(item) for item in value), [])
     return []
+
+
+def recovered_count(value) -> int:
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else 0
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def run_job(config: dict, job: dict) -> None:
@@ -265,10 +278,11 @@ def run_job(config: dict, job: dict) -> None:
                     }.items() if value not in (None, -1)})
                     telemetry["capabilities"] = config.get("_capabilities") or {}
                     runtime["last"] = {"name": config["worker_name"], "progress": done / total * 100 if total else 0,
-                        "speed_hps": speed, "speed": f"{speed:,.0f} H/s", "recovered": int(status.get("recovered_hashes") or 0),
+                        "speed_hps": speed, "speed": f"{speed:,.0f} H/s",
+                        "recovered": recovered_count(status.get("recovered_hashes", status.get("recovered", 0))),
                         "candidates_done": int(done), "candidates_total": int(total), "eta": str(status.get("estimated_stop") or ""),
                         "telemetry": telemetry}
-                except (ValueError, KeyError, urllib.error.URLError):
+                except (ValueError, TypeError, KeyError, json.JSONDecodeError, urllib.error.URLError):
                     pass
     code = process.wait()
     controller_stop.set(); controller.join(timeout=3); throttle.join(timeout=3)
@@ -296,6 +310,9 @@ def main() -> None:
             if response.get("job"):
                 try:
                     run_job(config, response["job"])
+                except MissingSourceError as error:
+                    api(config, f"/api/lan/jobs/{response['job']['id']}/defer", {
+                        "name": config["worker_name"], "reason": str(error)})
                 except Exception as error:
                     api(config, f"/api/lan/jobs/{response['job']['id']}/complete", {
                         "name": config["worker_name"], "exit_code": 2, "outfile": "", "log": f"Worker preparation failed: {error}"})

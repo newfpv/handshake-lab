@@ -2,6 +2,15 @@
 
 All notable changes to NewFPV Handshake Lab are documented here.
 
+## 1.3.2 — 2026-07-20
+
+- Prevented a LAN worker with a missing dictionary or rule from rapidly failing every remaining queue job.
+- Missing remote sources now return the affected job to Queued and automatically pause only that worker lane.
+- Added a dedicated worker defer protocol while retaining server-side protection for v1.3.1 workers.
+- Fixed Hashcat 7.1.2 LAN status parsing when `recovered_hashes` is returned as a `[found,total]` pair.
+- Added exact queue method details on hover/focus, including dictionary, rule, hybrid mask, mask and increment settings.
+- Documented correct JSON escaping for Windows UNC source roots.
+
 ## 1.3.1 — 2026-07-20
 
 - Queue `Elapsed` now measures active Hashcat time for each individual job; queue waiting, pauses and worker outages are excluded while checkpoint resumes keep the accumulated task time.

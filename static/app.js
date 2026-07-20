@@ -400,8 +400,9 @@ function renderQueue(){
     const elapsedText = elapsed == null ? '—' : fmtDuration(elapsed);
     const remainingText = remaining == null ? 'Calculating' : terminalJobStates.has(job.status) ? 'Done' : `~${fmtDuration(remaining)}`;
     const candidatesText = job.candidates_total ? `${Number(job.candidates_done).toLocaleString()} / ${Number(job.candidates_total).toLocaleString()}` : 'Waiting for keyspace';
+    const methodDetail = job.method_detail || job.attempt_label || job.strategy_name;
     return `<article class="job-row ${job.status}" data-job-id="${job.id}">
-    <span class="job-id">#${String(job.id).padStart(3,'0')}</span><div class="job-main"><h3>${esc(job.capture_name)}</h3><p>${job.preset_name ? `${esc(job.preset_name)} · ` : ''}${esc(job.strategy_name)}${visibleError ? ` · ${esc(visibleError)}` : ''}</p></div>
+    <span class="job-id">#${String(job.id).padStart(3,'0')}</span><div class="job-main"><h3>${esc(job.capture_name)}</h3><p>${job.preset_name ? `${esc(job.preset_name)} · ` : ''}<button type="button" class="job-method" data-detail="${esc(methodDetail)}" title="${esc(methodDetail)}" aria-label="Method details: ${esc(methodDetail)}">${esc(job.strategy_name)}</button>${visibleError ? ` · ${esc(visibleError)}` : ''}</p></div>
     <span class="job-status">${esc(visibleStatus)} · W${job.workload || 3}</span><div class="job-progress"><div class="progress"><i style="width:${Math.max(0,Math.min(100,job.progress))}%"></i></div><div class="job-progress-metrics"><span><small>PROGRESS</small><b>${Number(job.progress).toFixed(2)}%</b></span><span><small>SPEED</small><b>${esc(job.speed || '—')}</b></span></div><div class="job-time-metrics"><span><small>CANDIDATES</small><b>${candidatesText}</b></span><span><small>ELAPSED</small><b>${elapsedText}</b></span><span><small>REMAINING</small><b>${remainingText}</b></span></div></div><div class="job-actions">${jobButtons(job)}</div>
   </article>`}).join('') : `<div class="empty-state"><svg><use href="#i-wave"/></svg><b>The queue is empty</b><span>Configure a pipeline and choose Start queue.</span></div>`;
   $$('.job-row').forEach(row => {

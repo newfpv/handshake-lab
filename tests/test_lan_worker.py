@@ -25,6 +25,11 @@ class LanWorkerTests(unittest.TestCase):
             self.assertEqual(loaded["wordlist_roots"], [r"C:\HandshakeWordlists"])
             self.assertEqual(__import__("json").loads(config.read_text(encoding="utf-8"))["wordlist_roots"], [r"C:\HandshakeWordlists"])
 
+    def test_hashcat_712_recovered_pair_uses_found_count(self):
+        self.assertEqual(self.worker.recovered_count([0, 1]), 0)
+        self.assertEqual(self.worker.recovered_count([1, 1]), 1)
+        self.assertEqual(self.worker.recovered_count(2), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 # Handshake Lab
 
-![Release](https://img.shields.io/badge/release-1.3.1-20e4f4?style=flat-square)
+![Release](https://img.shields.io/badge/release-1.3.2-20e4f4?style=flat-square)
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-20e4f4?style=flat-square)
 ![Local first](https://img.shields.io/badge/data-local%20only-30e37b?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-f4f6f7?style=flat-square)
@@ -126,6 +126,8 @@ README stays intentionally short so installation is obvious; the built-in Wiki i
 3. Copy the portable release to PC 2 and run `start-worker.bat` once.
 4. Put the coordinator URL, generated token and candidate-source folders into `lan-worker.json`.
 5. Run `start-worker.bat` again.
+
+UNC roots must be valid JSON strings. For the Windows path `\\MAIN-PC\share\wordlists`, enter `"\\\\MAIN-PC\\share\\wordlists"` in `lan-worker.json`. If an exact source is unavailable, Handshake Lab returns the job to the queue and pauses that worker lane instead of cascading failures through later jobs.
 
 The coordinator shows a worker only while its heartbeat is online. Offline worker cards and telemetry disappear automatically. Each connected worker sends idle and active NVIDIA telemetry and has independent CPU/GPU profiles. See **Help & Wiki → Two computers on one LAN** for the secure full procedure.
 

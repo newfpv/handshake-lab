@@ -470,6 +470,38 @@ def row_dict(row: sqlite3.Row) -> dict:
     return result
 
 
+def strategy_method_detail(strategy: dict, sources: dict[int, dict]) -> str:
+    mode = str(strategy.get("mode") or "")
+    config = strategy.get("config") if isinstance(strategy.get("config"), dict) else {}
+
+    def source_name(field: str) -> str:
+        source_id = int(config.get(field) or 0)
+        source = sources.get(source_id)
+        return str(source.get("filename") or f"Missing source #{source_id}") if source else f"Missing source #{source_id}"
+
+    if mode == "known":
+        detail = "Known results · local potfile and imported recovered passwords"
+    elif mode == "common":
+        detail = f"Common passwords v{COMMON_CANDIDATE_VERSION} · ranked built-ins and target-network variants"
+    elif mode == "pattern":
+        detail = f"Pattern Builder v{PATTERN_BUILDER_VERSION} · generated from verified local results and the target network"
+    elif mode == "dictionary":
+        detail = f"Dictionary · {source_name('wordlist_id')}"
+    elif mode == "rules":
+        detail = f"Dictionary · {source_name('wordlist_id')} · Rule · {source_name('rule_id')}"
+    elif mode == "hybrid":
+        detail = f"Dictionary · {source_name('wordlist_id')} · Suffix mask · {config.get('mask') or '?d?d?d?d'}"
+    elif mode == "mask":
+        detail = f"Mask · {config.get('mask') or '?d?d?d?d?d?d?d?d'}"
+        if config.get("increment"):
+            detail += " · Increment enabled"
+    else:
+        detail = str(strategy.get("name") or mode.title() or "Custom stage")
+    if config.get("optimized"):
+        detail += " · Optimized kernel"
+    return detail
+
+
 def latest_lan_log_telemetry(path: Path, sampled_at: str | None = None) -> dict:
     if not path.is_file():
         return {}
@@ -3095,6 +3127,11 @@ def state():
                ORDER BY CASE WHEN j.status IN ('running','paused','lan_preparing','lan_running','lan_paused') THEN 0 WHEN j.status='queued' THEN 1 ELSE 2 END,
                         CASE WHEN j.status IN ('running','paused','lan_preparing','lan_running','lan_paused','queued') THEN j.position ELSE -j.id END,j.id
                LIMIT 200""")]
+        strategy_by_id = {int(item["id"]): item for item in strategies}
+        source_by_id = {int(item["id"]): item for item in wordlists}
+        for job in jobs:
+            strategy = strategy_by_id.get(int(job["strategy_id"]), {"name": job.get("strategy_name")})
+            job["method_detail"] = strategy_method_detail(strategy, source_by_id)
         results = [row_dict(row) for row in connection.execute("SELECT * FROM results ORDER BY id DESC LIMIT 500")]
         attempts = [row_dict(row) for row in connection.execute(
             "SELECT * FROM network_attempts ORDER BY completed_at DESC,id DESC"
@@ -4302,6 +4339,45 @@ def lan_progress(job_id: int):
     return jsonify({"command": command, "workload": int(worker["workload"] or 3) if worker else 3})
 
 
+def worker_preparation_error(log_text: str) -> str:
+    marker = "Worker preparation failed:"
+    if marker not in log_text:
+        return ""
+    return log_text.split(marker, 1)[1].strip().splitlines()[0][:500] or "Worker preparation failed"
+
+
+def defer_lan_job_for_source(connection: sqlite3.Connection, job_id: int, worker_name: str, reason: str) -> bool:
+    stop_job_clock(connection, job_id)
+    changed = connection.execute(
+        """UPDATE jobs SET status='queued',worker_name='',remote_command='',finished_at=NULL,
+                  active_started_at=NULL,error=?
+           WHERE id=? AND worker_name=? AND status IN ('lan_preparing','lan_running','lan_paused')""",
+        (f"Waiting for LAN source · {reason}"[:1000], job_id, worker_name),
+    ).rowcount
+    if changed:
+        connection.execute(
+            "UPDATE lan_workers SET paused=1,status='idle',current_job_id=NULL,last_seen=? WHERE name=?",
+            (now(), worker_name),
+        )
+    return bool(changed)
+
+
+@app.post("/api/lan/jobs/<int:job_id>/defer")
+def lan_defer_job(job_id: int):
+    if not lan_authorized():
+        return jsonify({"error": "LAN worker authentication failed"}), 401
+    payload = request.get_json(force=True)
+    name = str(payload.get("name") or "")[:80]
+    reason = str(payload.get("reason") or "Candidate source is unavailable on this worker")[:500]
+    with db() as connection:
+        changed = defer_lan_job_for_source(connection, job_id, name, reason)
+    if not changed:
+        return jsonify({"error": "Job is no longer assigned to this worker"}), 409
+    add_event("error", f"LAN worker {name} paused: {reason}. Job {job_id} returned to the queue")
+    notify_user("worker", "Worker needs a source", f"{name} was paused; Job #{job_id} returned to the queue. {reason}", f"worker-source:{name}", 600)
+    return jsonify({"ok": True, "deferred": True, "worker_paused": True})
+
+
 @app.post("/api/lan/jobs/<int:job_id>/complete")
 def lan_complete(job_id: int):
     if not lan_authorized():
@@ -4317,11 +4393,23 @@ def lan_complete(job_id: int):
     job = dict(row)
     if job["status"] not in {"lan_preparing", "lan_running", "lan_paused"}:
         return jsonify({"ok": True, "ignored": True, "reason": "Job is no longer active"})
+    worker_log = str(payload.get("log") or "")[-200000:]
+    preparation_error = worker_preparation_error(worker_log)
+    if preparation_error:
+        log_path = ROOT / "logs" / f"job-{job_id}-lan.log"
+        log_path.write_text(worker_log, encoding="utf-8")
+        with db() as connection:
+            connection.execute("UPDATE jobs SET log_path=? WHERE id=?", (str(log_path), job_id))
+            changed = defer_lan_job_for_source(connection, job_id, name, preparation_error)
+        if changed:
+            add_event("error", f"LAN worker {name} paused: {preparation_error}. Job {job_id} returned to the queue")
+            notify_user("worker", "Worker needs attention", f"{name} was paused; Job #{job_id} returned to the queue. {preparation_error}", f"worker-preparation:{name}", 600)
+        return jsonify({"ok": True, "deferred": changed, "worker_paused": changed})
     runtime_hash, capture_lookup, _ = prepare_job_hashes(job)
     outfile = DATA / f"job-{job_id}-lan-found.txt"
     outfile.write_text(str(payload.get("outfile") or ""), encoding="utf-8")
     log_path = ROOT / "logs" / f"job-{job_id}-lan.log"
-    log_path.write_text(str(payload.get("log") or "")[-200000:], encoding="utf-8")
+    log_path.write_text(worker_log, encoding="utf-8")
     imported, recovered = import_outfile(outfile, job["capture_id"], job["strategy_name"], runtime_hash, capture_lookup, job_id)
     code = int(payload.get("exit_code", 1))
     with db() as connection:
