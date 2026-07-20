@@ -2,6 +2,17 @@
 
 All notable changes to NewFPV Handshake Lab are documented here.
 
+## 1.3.1 — 2026-07-20
+
+- Queue `Elapsed` now measures active Hashcat time for each individual job; queue waiting, pauses and worker outages are excluded while checkpoint resumes keep the accumulated task time.
+- Rebuilt queue progress cards with readable progress, speed, candidate, elapsed and remaining metrics on desktop and mobile.
+- Added an optional second self-signed HTTPS listener without removing the existing HTTP listener.
+- Added a self-signed Telegram Web App fallback for users who explicitly accept certificate warnings.
+- Made notification tests unmistakably test-only and gave recovered-password alerts a network-specific title.
+- Added a bundled certificate dependency to the portable bootstrap and documented separate HTTPS port forwarding.
+- Replaced the browser Basic Auth prompt with a branded responsive sign-in page, seven-day sessions, sign-out and login rate limiting while retaining Basic Auth for API clients.
+- Stabilized desktop queue columns and reserved action space so live progress updates no longer reflow the card.
+
 ## 1.3.0 — 2026-07-20
 
 - Added a Telegram inline control panel with status, queue, results, master pause/resume and instant W1–W4 actions.

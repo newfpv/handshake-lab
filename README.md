@@ -1,6 +1,6 @@
 # Handshake Lab
 
-![Release](https://img.shields.io/badge/release-1.3.0-20e4f4?style=flat-square)
+![Release](https://img.shields.io/badge/release-1.3.1-20e4f4?style=flat-square)
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-20e4f4?style=flat-square)
 ![Local first](https://img.shields.io/badge/data-local%20only-30e37b?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-f4f6f7?style=flat-square)
@@ -88,7 +88,9 @@ Remote access is private and disabled by default. In **Settings → Public-IP ac
 4. Press **Check address**. The bot then adds **Open Handshake Lab** to its inline panel and persistent Telegram menu.
 5. Forward a proxy port on the router only when direct hosting is required; tunnels and VPN shares normally need no inbound forwarding.
 
-Public clients must authenticate with HTTP Basic and cross-origin write requests are rejected. Telegram Mini Apps require a trusted HTTPS URL, so Handshake Lab rejects plain HTTP and embedded credentials in that field. A certificate cannot be created safely from a bare public IP; use a hostname, authenticated tunnel or HTTPS-capable private VPN. Handshake Lab never enables UPnP or changes the router automatically.
+Public browser clients use the responsive Handshake Lab sign-in screen, a rate-limited seven-day session and an explicit Sign out action. Scripted API clients may still use HTTP Basic credentials. Cross-origin write requests are rejected. Telegram Mini Apps require HTTPS, so Handshake Lab rejects plain HTTP and embedded credentials in the trusted URL field. Handshake Lab never enables UPnP or changes the router automatically.
+
+For temporary personal use, **Self-signed HTTPS** can keep HTTP on `8787` and start a second encrypted listener on `8788`. Forward the second port separately. The certificate includes the current public and local addresses but is not trusted by browsers or Telegram, so warnings or Mini App rejection are expected. A trusted URL always takes priority when configured.
 
 ## Requirements
 
@@ -107,7 +109,7 @@ The exhaustive documentation lives inside the app under **Help & Wiki**. It is s
 - source ordering, cleanup and cascade deduplication;
 - Wordlist Analyzer metrics, streaming behavior and ETA;
 - every pipeline stage, mask syntax and Pattern Builder;
-- overnight queues, checkpoints, timing and GPU/CPU profiles;
+- overnight queues, checkpoints, per-job active elapsed time, remaining-time estimates and GPU/CPU profiles;
 - local files, backups, restores and PWMenu-compatible `recovered.csv` exports;
 - complete two-computer LAN setup;
 - live W1–W4 behavior and the exclusive WPA benchmark;

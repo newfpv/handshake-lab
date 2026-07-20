@@ -20,21 +20,17 @@ const fmtDuration = value => {
 };
 
 function elapsedJobSeconds(job){
-  const started = timeValue(job.started_at);
-  if(started == null) return null;
-  if(job.status === 'queued'){
-    const speed = Number(job.speed_hps || 0), done = Number(job.candidates_done || 0);
-    return speed > 0 && done > 0 ? done / speed : null;
+  let elapsed = Math.max(0, Number(job.elapsed_seconds || 0));
+  const activeStarted = timeValue(job.active_started_at);
+  if(activeStarted != null && ['running','lan_preparing','lan_running'].includes(job.status)){
+    elapsed += Math.max(0, (Date.now() - activeStarted) / 1000);
   }
-  const ended = timeValue(job.finished_at) ?? Date.now();
-  return Math.max(0, (ended - started) / 1000);
+  if(elapsed > 0 || job.started_at) return elapsed;
+  return null;
 }
 
 function historicalStageSeconds(strategyId){
-  const samples = state.jobs.filter(job => job.strategy_id === Number(strategyId) && job.status === 'complete' && job.started_at && job.finished_at).map(job => {
-    const start = timeValue(job.started_at), finish = timeValue(job.finished_at);
-    return start != null && finish != null ? (finish - start) / 1000 : 0;
-  }).filter(value => value > 0).sort((a,b) => a-b);
+  const samples = state.jobs.filter(job => job.strategy_id === Number(strategyId) && job.status === 'complete').map(job => elapsedJobSeconds(job) || 0).filter(value => value > 0).sort((a,b) => a-b);
   if(!samples.length) return null;
   const middle = Math.floor(samples.length / 2);
   return samples.length % 2 ? samples[middle] : (samples[middle - 1] + samples[middle]) / 2;
@@ -400,9 +396,13 @@ function renderQueue(){
     const remoteOffline = job.status.startsWith('lan_') && !connectedNames.has(job.worker_name);
     const visibleStatus = remoteOffline ? (job.status === 'lan_paused' ? 'paused' : 'waiting') : job.status.replace(/^lan_/, '');
     const visibleError = String(job.error || '').replace(/^LAN worker /, 'Worker ');
+    const elapsed = elapsedJobSeconds(job), remaining = remainingJobSeconds(job);
+    const elapsedText = elapsed == null ? '—' : fmtDuration(elapsed);
+    const remainingText = remaining == null ? 'Calculating' : terminalJobStates.has(job.status) ? 'Done' : `~${fmtDuration(remaining)}`;
+    const candidatesText = job.candidates_total ? `${Number(job.candidates_done).toLocaleString()} / ${Number(job.candidates_total).toLocaleString()}` : 'Waiting for keyspace';
     return `<article class="job-row ${job.status}" data-job-id="${job.id}">
-    <span class="job-id">#${String(job.id).padStart(3,'0')}</span><div><h3>${esc(job.capture_name)}</h3><p>${job.preset_name ? `${esc(job.preset_name)} · ` : ''}${esc(job.strategy_name)}${visibleError ? ` · ${esc(visibleError)}` : ''}</p></div>
-    <span class="job-status">${esc(visibleStatus)} · W${job.workload || 3}</span><div class="job-progress"><div class="progress"><i style="width:${Math.max(0,Math.min(100,job.progress))}%"></i></div><span>${Number(job.progress).toFixed(2)}% · ${esc(job.speed || '—')} · ${job.recovered || 0} recovered</span><small>${job.candidates_total ? `${Number(job.candidates_done).toLocaleString()} / ${Number(job.candidates_total).toLocaleString()} candidates` : 'Keyspace waiting'} · ${esc(jobTimingLabel(job))}</small></div><div class="job-actions">${jobButtons(job)}</div>
+    <span class="job-id">#${String(job.id).padStart(3,'0')}</span><div class="job-main"><h3>${esc(job.capture_name)}</h3><p>${job.preset_name ? `${esc(job.preset_name)} · ` : ''}${esc(job.strategy_name)}${visibleError ? ` · ${esc(visibleError)}` : ''}</p></div>
+    <span class="job-status">${esc(visibleStatus)} · W${job.workload || 3}</span><div class="job-progress"><div class="progress"><i style="width:${Math.max(0,Math.min(100,job.progress))}%"></i></div><div class="job-progress-metrics"><span><small>PROGRESS</small><b>${Number(job.progress).toFixed(2)}%</b></span><span><small>SPEED</small><b>${esc(job.speed || '—')}</b></span></div><div class="job-time-metrics"><span><small>CANDIDATES</small><b>${candidatesText}</b></span><span><small>ELAPSED</small><b>${elapsedText}</b></span><span><small>REMAINING</small><b>${remainingText}</b></span></div></div><div class="job-actions">${jobButtons(job)}</div>
   </article>`}).join('') : `<div class="empty-state"><svg><use href="#i-wave"/></svg><b>The queue is empty</b><span>Configure a pipeline and choose Start queue.</span></div>`;
   $$('.job-row').forEach(row => {
     const label = $('.job-id', row);
@@ -554,6 +554,8 @@ function renderSettings(){
     $('#remoteAccessEnabled').checked=Boolean(state.config.remote_access_enabled);
     $('#remoteUsername').value=state.config.remote_username||'newfpv';
     $('#remoteHttpsUrl').value=state.config.remote_https_url||'';
+    $('#selfSignedHttps').checked=Boolean(state.config.self_signed_https_enabled);
+    $('#httpsPort').value=state.config.https_port||8788;
     $('#remotePassword').placeholder=state.config.remote_password_configured?'Configured · enter only to replace':'At least 12 characters';
   }
   const workers=onlineLanWorkers();
@@ -1120,7 +1122,7 @@ $('#startQueue').onclick = async () => {
 
 $('#saveSettings').onclick = async () => {
   const button=$('#saveSettings');
-  const payload = {hashcat_path:$('#hashcatPath').value.trim(),hcxpcapngtool_path:$('#hcxPath').value.trim(),host:$('#hostSetting').value.trim(),port:Number($('#portSetting').value),max_workers:Number($('#workerSetting').value),workload_profile:Number($('#workloadSetting').value),temperature_abort:Number($('#temperatureSetting').value),lan_enabled:$('#lanEnabled').checked,lan_token:$('#lanToken').value.trim(),lan_job_timeout:Number($('#lanTimeout').value),notifications_windows:$('#windowsNotifications').checked,notifications_telegram:$('#telegramNotifications').checked,telegram_bot_token:$('#telegramBotToken').value.trim(),telegram_chat_id:$('#telegramChatId').value.trim(),telegram_file_intake:$('#telegramFileIntake').checked,notify_password_found:$('#notifyPassword').checked,notify_overheat:$('#notifyOverheat').checked,notify_worker_error:$('#notifyWorker').checked,notify_queue_complete:$('#notifyQueue').checked,remote_access_enabled:$('#remoteAccessEnabled').checked,remote_username:$('#remoteUsername').value.trim(),remote_password:$('#remotePassword').value,remote_https_url:$('#remoteHttpsUrl').value.trim()};
+  const payload = {hashcat_path:$('#hashcatPath').value.trim(),hcxpcapngtool_path:$('#hcxPath').value.trim(),host:$('#hostSetting').value.trim(),port:Number($('#portSetting').value),max_workers:Number($('#workerSetting').value),workload_profile:Number($('#workloadSetting').value),temperature_abort:Number($('#temperatureSetting').value),lan_enabled:$('#lanEnabled').checked,lan_token:$('#lanToken').value.trim(),lan_job_timeout:Number($('#lanTimeout').value),notifications_windows:$('#windowsNotifications').checked,notifications_telegram:$('#telegramNotifications').checked,telegram_bot_token:$('#telegramBotToken').value.trim(),telegram_chat_id:$('#telegramChatId').value.trim(),telegram_file_intake:$('#telegramFileIntake').checked,notify_password_found:$('#notifyPassword').checked,notify_overheat:$('#notifyOverheat').checked,notify_worker_error:$('#notifyWorker').checked,notify_queue_complete:$('#notifyQueue').checked,remote_access_enabled:$('#remoteAccessEnabled').checked,remote_username:$('#remoteUsername').value.trim(),remote_password:$('#remotePassword').value,remote_https_url:$('#remoteHttpsUrl').value.trim(),self_signed_https_enabled:$('#selfSignedHttps').checked,https_port:Number($('#httpsPort').value)};
   button.disabled=true;
   try{
     const result=await api('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -1140,7 +1142,7 @@ $('#testWindowsNotification').onclick=async event=>{const button=event.currentTa
 $('#testTelegramNotification').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{await api('/api/notifications/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'telegram'})});toast('Telegram test message sent')}catch(error){toast(error.message,true)}finally{button.disabled=false}};
 $('#testAllNotifications').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{const result=await api('/api/notifications/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'all'})});toast(`Test sent: ${result.sent.join(' + ')}`)}catch(error){toast(error.message,true)}finally{button.disabled=false}};
 $('#runBenchmark').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{await api('/api/benchmark',{method:'POST'});toast('WPA 22000 benchmark started');pollBenchmark()}catch(error){toast(error.message,true)}finally{button.disabled=false}};
-$('#checkPublicAddress').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{const result=await api('/api/remote/status');const box=$('#remoteStatus');box.innerHTML=result.url?`<b>${esc(result.url)}</b><span>${result.https_url?'HTTPS is ready for the Telegram Mini App button.':result.enabled&&result.listening_publicly?'Listener ready; add trusted HTTPS before using it as a Telegram Mini App.':'Enable remote access, save and restart before exposing the listener.'}</span>`:`<b>Public address unavailable</b><span>${esc(result.error||'Check the internet connection.')}</span>`}catch(error){toast(error.message,true)}finally{button.disabled=false}};
+$('#checkPublicAddress').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{const result=await api('/api/remote/status');const box=$('#remoteStatus');const address=result.https_url||result.url;box.innerHTML=address?`<b>${esc(address)}</b><span>${result.self_signed_https_url?'Self-signed HTTPS is running. Forward its port separately; certificate warnings are expected.':result.https_url?'Trusted HTTPS is ready for Telegram Mini App.':result.enabled&&result.listening_publicly?'HTTP listener is reachable locally; use the LAN address at home and public address outside your Wi-Fi.':'Enable remote access, save and restart before exposing the listener.'}</span>`:`<b>Public address unavailable</b><span>${esc(result.error||'Check the internet connection.')}</span>`}catch(error){toast(error.message,true)}finally{button.disabled=false}};
 
 $('#liveCpuProfile').onchange = async event => {
   const previous=state.config.cpu_profile||'off',profile=event.target.value;

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#070809">
+  <title>Sign in // Handshake Lab</title>
+  <link rel="icon" href="{{ url_for('static', filename='favicon.svg', v='1.3.1') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v='1.3.1') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='release.css', v='1.3.1') }}">
+</head>
+<body class="remote-login-page">
+  <div class="noise"></div>
+  <main class="remote-login-shell">
+    <section class="remote-login-intro">
+      <span class="eyebrow"><i></i> PRIVATE RECOVERY CONSOLE</span>
+      <div class="remote-login-brand"><span class="brand-mark">N</span><span><b>HANDSHAKE LAB</b><small>REMOTE ACCESS</small></span></div>
+      <h1>YOUR QUEUE.<br><span>ANYWHERE.</span></h1>
+      <p>Control the GPU lane, inspect captures and collect verified results through one protected session.</p>
+      <div class="remote-login-signals"><span><i></i>LOCAL DATA</span><span><i></i>AUTH REQUIRED</span><span><i></i>7 DAY SESSION</span></div>
+    </section>
+    <section class="remote-login-card">
+      <header><span>AUTH / 01</span><b>Secure workspace</b></header>
+      <h2>Sign in</h2>
+      <p>Use the Remote Web credentials configured on the coordinator.</p>
+      {% if error %}<div class="remote-login-error">{{ error }}</div>{% endif %}
+      <form method="post" action="{{ url_for('remote_login') }}" autocomplete="on">
+        <input type="hidden" name="next" value="{{ next_path }}">
+        <label><span>USERNAME</span><input name="username" value="{{ username }}" autocomplete="username" required autofocus></label>
+        <label><span>PASSWORD</span><input name="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit">Enter Handshake Lab <span>→</span></button>
+      </form>
+      <footer><i></i><span>Credentials stay on your coordinator. Repeated failures are rate-limited.</span></footer>
+    </section>
+  </main>
+</body>
+</html>

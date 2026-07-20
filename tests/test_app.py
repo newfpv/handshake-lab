@@ -73,6 +73,23 @@ class AuditAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("HTTPS", response.get_json()["error"])
 
+    def test_self_signed_https_url_is_used_only_when_explicitly_enabled(self):
+        original_url = audit.SELF_SIGNED_HTTPS_URL
+        try:
+            audit.SELF_SIGNED_HTTPS_URL = "https://203.0.113.4:8788"
+            config = audit.load_config()
+            config.update({"remote_access_enabled": True, "self_signed_https_enabled": True, "remote_https_url": ""})
+            self.assertEqual(audit.telegram_https_url(config), "https://203.0.113.4:8788")
+            config["self_signed_https_enabled"] = False
+            self.assertEqual(audit.telegram_https_url(config), "")
+        finally:
+            audit.SELF_SIGNED_HTTPS_URL = original_url
+
+    def test_http_and_https_listener_ports_must_differ(self):
+        response = self.client.put("/api/config", json={"port": 8788, "https_port": 8788, "self_signed_https_enabled": True})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("different port", response.get_json()["error"])
+
     def test_common_candidates_are_ranked_and_capture_specific(self):
         path = Path(self.temp.name) / "common.22000"
         path.write_text(SAMPLE, encoding="utf-8")
@@ -182,6 +199,24 @@ class AuditAppTests(unittest.TestCase):
         self.assertEqual(allowed.status_code, 200)
         self.assertNotIn("remote_password_hash", allowed.get_json()["config"])
 
+    def test_public_browser_uses_branded_session_login(self):
+        saved = self.client.put("/api/config", json={
+            "remote_access_enabled": True, "remote_username": "owner", "remote_password": "correct-horse-123"
+        })
+        self.assertEqual(saved.status_code, 200)
+        redirected = self.client.get("/", environ_base={"REMOTE_ADDR": "8.8.8.8"})
+        self.assertEqual(redirected.status_code, 302)
+        self.assertIn("/login", redirected.headers["Location"])
+        login_page = self.client.get("/login", environ_base={"REMOTE_ADDR": "8.8.8.8"})
+        self.assertIn("YOUR QUEUE", login_page.get_data(as_text=True))
+        accepted = self.client.post("/login", data={
+            "username": "owner", "password": "correct-horse-123", "next": "/"
+        }, environ_base={"REMOTE_ADDR": "8.8.8.8"})
+        self.assertEqual(accepted.status_code, 302)
+        panel = self.client.get("/", environ_base={"REMOTE_ADDR": "8.8.8.8"})
+        self.assertEqual(panel.status_code, 200)
+        self.assertIn("Sign out", panel.get_data(as_text=True))
+
     def test_lan_worker_reports_idle_telemetry(self):
         self.client.put("/api/config", json={"lan_enabled": True, "lan_token": "test-lan-token"})
         headers = {"Authorization": "Bearer test-lan-token"}
@@ -221,6 +256,32 @@ class AuditAppTests(unittest.TestCase):
                 (job_id,),
             ).fetchone()
         self.assertEqual(tuple(job), ("queued", 0.0, "", "", "", "", "", 0, 0, 0))
+
+    def test_job_elapsed_clock_counts_only_active_task_time(self):
+        capture_path = Path(self.temp.name) / "elapsed.22000"
+        capture_path.write_text(SAMPLE, encoding="utf-8")
+        with audit.db() as connection:
+            capture_id = connection.execute(
+                """INSERT INTO captures(filename,stored_path,hash_path,kind,networks,status,sha256,imported_at)
+                   VALUES('elapsed.22000',?,?,'22000',1,'ready','elapsed-sha',?)""",
+                (str(capture_path), str(capture_path), audit.now()),
+            ).lastrowid
+            strategy_id = connection.execute("SELECT id FROM strategies ORDER BY id LIMIT 1").fetchone()[0]
+            job_id = connection.execute(
+                """INSERT INTO jobs(capture_id,strategy_id,status,session_name,created_at,elapsed_seconds)
+                   VALUES(?,?,'queued','elapsed-test',?,10)""",
+                (capture_id, strategy_id, audit.now()),
+            ).lastrowid
+            audit.start_job_clock(connection, job_id, "2026-07-20T10:00:00+00:00")
+            audit.stop_job_clock(connection, job_id, "2026-07-20T10:00:05+00:00")
+            audit.start_job_clock(connection, job_id, "2026-07-20T11:00:00+00:00")
+            audit.stop_job_clock(connection, job_id, "2026-07-20T11:00:03+00:00")
+            row = connection.execute(
+                "SELECT started_at,active_started_at,elapsed_seconds FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        self.assertEqual(row["started_at"], "2026-07-20T10:00:00+00:00")
+        self.assertIsNone(row["active_started_at"])
+        self.assertEqual(row["elapsed_seconds"], 18)
 
     def test_os_level_process_pause_and_resume(self):
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])

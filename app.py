@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import sqlite3
 import subprocess
 import threading
@@ -24,10 +25,10 @@ import urllib.parse
 import urllib.request
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
@@ -55,11 +56,14 @@ WORDLIST_ANALYSIS_LOCK = threading.Lock()
 WORDLIST_ANALYSIS_ACTIVE: set[int] = set()
 NOTIFICATION_LOCK = threading.Lock()
 NOTIFICATION_LAST_SENT: dict[str, float] = {}
+LOGIN_ATTEMPT_LOCK = threading.Lock()
+LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 BENCHMARK_LOCK = threading.Lock()
 BENCHMARK_STATE: dict[str, object] = {"status": "idle", "speed": "", "speed_hps": 0.0, "output": "", "error": ""}
 BENCHMARK_PATH = DATA / "benchmark.json"
 TELEGRAM_INTAKE_STOP = threading.Event()
 TELEGRAM_OFFSET_PATH = DATA / "telegram-update-offset.txt"
+SELF_SIGNED_HTTPS_URL = ""
 ALLOWED_CAPTURES = {".22000", ".hc22000", ".pcap", ".pcapng", ".cap"}
 ALLOWED_WORDLISTS = {".txt", ".dic", ".dict", ".lst", ".wordlist"}
 ALLOWED_RULES = {".rule"}
@@ -121,6 +125,8 @@ def default_config() -> dict:
         "remote_username": "newfpv",
         "remote_password_hash": "",
         "remote_https_url": "",
+        "self_signed_https_enabled": False,
+        "https_port": 8788,
         "workspace_root": str(ROOT),
     }
 
@@ -177,6 +183,45 @@ def ensure_column(connection: sqlite3.Connection, table: str, column: str, defin
     columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
     if column not in columns:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def stop_job_clock(connection: sqlite3.Connection, job_id: int, stopped_at: str | None = None) -> None:
+    """Persist active execution time for one job without counting pauses or queue time."""
+    row = connection.execute(
+        "SELECT elapsed_seconds,active_started_at FROM jobs WHERE id=?",
+        (job_id,),
+    ).fetchone()
+    if not row or not row["active_started_at"]:
+        return
+    stopped = stopped_at or now()
+    try:
+        started_value = datetime.fromisoformat(str(row["active_started_at"]))
+        stopped_value = datetime.fromisoformat(stopped)
+        seconds = max(0.0, (stopped_value - started_value).total_seconds())
+    except (TypeError, ValueError):
+        seconds = 0.0
+    connection.execute(
+        "UPDATE jobs SET elapsed_seconds=?,active_started_at=NULL WHERE id=?",
+        (float(row["elapsed_seconds"] or 0) + seconds, job_id),
+    )
+
+
+def start_job_clock(connection: sqlite3.Connection, job_id: int, started_at: str | None = None) -> None:
+    """Start or resume the active clock while preserving time already spent on this job."""
+    started = started_at or now()
+    connection.execute(
+        "UPDATE jobs SET started_at=COALESCE(started_at,?),active_started_at=? WHERE id=?",
+        (started, started, job_id),
+    )
+
+
+def stop_job_clocks(connection: sqlite3.Connection, statuses: tuple[str, ...]) -> None:
+    placeholders = ",".join("?" for _ in statuses)
+    for row in connection.execute(
+        f"SELECT id FROM jobs WHERE status IN ({placeholders}) AND active_started_at IS NOT NULL",
+        statuses,
+    ).fetchall():
+        stop_job_clock(connection, int(row["id"]))
 
 
 def builtin_presets() -> list[tuple[str, str, dict]]:
@@ -319,10 +364,20 @@ def init_storage() -> None:
         ensure_column(connection, "jobs", "worker_name", "TEXT NOT NULL DEFAULT ''")
         ensure_column(connection, "jobs", "remote_command", "TEXT NOT NULL DEFAULT ''")
         ensure_column(connection, "jobs", "cpu_profile", "TEXT NOT NULL DEFAULT 'off'")
+        ensure_column(connection, "jobs", "elapsed_seconds", "REAL NOT NULL DEFAULT 0")
+        ensure_column(connection, "jobs", "active_started_at", "TEXT")
         ensure_column(connection, "lan_workers", "paused", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(connection, "lan_workers", "workload", "INTEGER NOT NULL DEFAULT 3")
         ensure_column(connection, "lan_workers", "cpu_profile", "TEXT NOT NULL DEFAULT 'off'")
         ensure_column(connection, "results", "job_id", "INTEGER")
+        # Backfill old installations once. New jobs use an active clock that excludes
+        # queue waiting and pauses; legacy rows can only provide their wall interval.
+        connection.execute(
+            """UPDATE jobs SET elapsed_seconds=MAX(0,(julianday(COALESCE(finished_at,?))-julianday(started_at))*86400)
+               WHERE elapsed_seconds=0 AND started_at IS NOT NULL""",
+            (now(),),
+        )
+        stop_job_clocks(connection, ("running", "paused", "lan_preparing", "lan_running", "lan_paused"))
         if relocated:
             for table, columns in {
                 "captures": ("stored_path", "hash_path", "diagnostic_path"),
@@ -1290,6 +1345,8 @@ def telegram_https_url(config: dict | None = None) -> str:
     if not current.get("remote_access_enabled"):
         return ""
     value = str(current.get("remote_https_url") or "").strip().rstrip("/")
+    if not value and current.get("self_signed_https_enabled"):
+        value = SELF_SIGNED_HTTPS_URL
     try:
         parsed = urllib.parse.urlsplit(value)
     except ValueError:
@@ -1297,6 +1354,85 @@ def telegram_https_url(config: dict | None = None) -> str:
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
         return ""
     return value
+
+
+def generate_self_signed_certificate() -> tuple[Path, Path, str]:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    tls_dir = DATA / "tls"
+    tls_dir.mkdir(parents=True, exist_ok=True)
+    certificate_path = tls_dir / "handshake-lab-self-signed.crt"
+    key_path = tls_dir / "handshake-lab-self-signed.key"
+    hostnames = {"localhost", socket.gethostname()}
+    addresses = {"127.0.0.1"}
+    try:
+        addresses.update(socket.gethostbyname_ex(socket.gethostname())[2])
+    except OSError:
+        pass
+    public_ip = ""
+    try:
+        with urllib.request.urlopen("https://api.ipify.org?format=json", timeout=6) as response:
+            public_ip = str(json.loads(response.read().decode("utf-8")).get("ip") or "")
+        ipaddress.ip_address(public_ip)
+        addresses.add(public_ip)
+    except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError):
+        public_ip = ""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Handshake Lab Local"),
+        x509.NameAttribute(NameOID.COMMON_NAME, "Handshake Lab self-signed"),
+    ])
+    alternate_names: list[x509.GeneralName] = [x509.DNSName(name) for name in sorted(hostnames) if name]
+    for address in sorted(addresses):
+        try:
+            alternate_names.append(x509.IPAddress(ipaddress.ip_address(address)))
+        except ValueError:
+            continue
+    timestamp = datetime.now(timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject).issuer_name(issuer).public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(timestamp - timedelta(minutes=5))
+        .not_valid_after(timestamp + timedelta(days=825))
+        .add_extension(x509.SubjectAlternativeName(alternate_names), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    temporary_key = key_path.with_suffix(".key.tmp")
+    temporary_certificate = certificate_path.with_suffix(".crt.tmp")
+    temporary_key.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()
+    ))
+    temporary_certificate.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    os.replace(temporary_key, key_path)
+    os.replace(temporary_certificate, certificate_path)
+    return certificate_path, key_path, public_ip
+
+
+def start_self_signed_https(config: dict) -> None:
+    global SELF_SIGNED_HTTPS_URL
+    if not (config.get("remote_access_enabled") and config.get("self_signed_https_enabled")):
+        SELF_SIGNED_HTTPS_URL = ""
+        return
+    try:
+        certificate_path, key_path, public_ip = generate_self_signed_certificate()
+        from werkzeug.serving import make_server
+        port = max(1, min(int(config.get("https_port", 8788)), 65535))
+        server = make_server(
+            str(config.get("host") or "0.0.0.0"), port, app, threaded=True,
+            ssl_context=(str(certificate_path), str(key_path)),
+        )
+        display_host = public_ip or "127.0.0.1"
+        SELF_SIGNED_HTTPS_URL = f"https://{display_host}:{port}"
+        threading.Thread(target=server.serve_forever, name="self-signed-https", daemon=True).start()
+        add_event("info", f"Self-signed HTTPS listener started on port {port}")
+    except Exception as error:
+        SELF_SIGNED_HTTPS_URL = ""
+        add_event("error", f"Self-signed HTTPS failed: {str(error)[:240]}")
 
 
 def telegram_keyboard(config: dict | None = None) -> dict:
@@ -1619,7 +1755,7 @@ def append_result(essid: str, bssid: str, password: str, capture_id: int | None,
             csv.writer(handle).writerow([essid, bssid, password, strategy, timestamp])
             handle.flush()
             os.fsync(handle.fileno())
-    notify_user("password", "Password recovered", f"{essid}: {password}", f"password:{fingerprint}")
+    notify_user("password", f"Password recovered · {essid}", f"Password: {password}", f"password:{fingerprint}")
     return True
 
 
@@ -2157,6 +2293,7 @@ class Runner:
                             if stale:
                                 connection.execute("UPDATE lan_workers SET status='offline',current_job_id=NULL WHERE name=?", (worker["name"],))
                                 if worker["current_job_id"]:
+                                    stop_job_clock(connection, int(worker["current_job_id"]))
                                     connection.execute("UPDATE jobs SET status='queued',worker_name='',remote_command='',error='LAN worker heartbeat timed out; safely requeued' WHERE id=? AND status IN ('lan_preparing','lan_running','lan_paused')", (worker["current_job_id"],))
                                 notify_user("worker", "Worker disconnected", f"{worker['name']} is offline; its active job was safely returned to the queue.", f"worker:{worker['name']}", 300)
                 with db() as connection:
@@ -2277,9 +2414,10 @@ class Runner:
             if load_config().get("queue_paused", False):
                 return
             with db() as connection:
+                started = now()
                 changed = connection.execute(
-                    "UPDATE jobs SET status='running',started_at=?,log_path=?,command_json=?,error='' WHERE id=? AND status='queued'",
-                    (now(), str(log_path), json.dumps(command), job_id),
+                    "UPDATE jobs SET status='running',started_at=COALESCE(started_at,?),active_started_at=?,log_path=?,command_json=?,error='' WHERE id=? AND status='queued'",
+                    (started, started, str(log_path), json.dumps(command), job_id),
                 ).rowcount
             if not changed:
                 return
@@ -2316,6 +2454,7 @@ class Runner:
                 if code in (0, 1) and not restore_path.is_file():
                     attempts_recorded = 0
                     with db() as connection:
+                        stop_job_clock(connection, job_id)
                         if job.get("mode") != "known":
                             attempts_recorded = insert_network_attempts(
                                 connection, job, parse_22000(Path(job["hash_path"])), recovered_networks
@@ -2328,6 +2467,7 @@ class Runner:
                     add_event("success", f"Job {job_id} completed before the W{requested_workload} checkpoint; {attempts_recorded} network attempt(s) remembered, {skipped} skipped")
                 elif self.patch_restore_workload(restore_path, requested_workload):
                     with db() as connection:
+                        stop_job_clock(connection, job_id)
                         connection.execute(
                             "UPDATE jobs SET status='queued',workload=?,error=?,finished_at=NULL WHERE id=?",
                             (requested_workload, f"Checkpoint restored with W{requested_workload}", job_id),
@@ -2335,6 +2475,7 @@ class Runner:
                     add_event("info", f"Job {job_id}: workload changed to W{requested_workload}; resuming from checkpoint")
                 else:
                     with db() as connection:
+                        stop_job_clock(connection, job_id)
                         connection.execute(
                             "UPDATE jobs SET status='blocked',workload=?,error=?,finished_at=? WHERE id=?",
                             (requested_workload, "Workload change checkpoint was not created; retry the job", now(), job_id),
@@ -2346,6 +2487,7 @@ class Runner:
             with db() as connection:
                 current = connection.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
                 if current not in {"cancelled"}:
+                    stop_job_clock(connection, job_id)
                     if self.shutting_down.is_set():
                         status, error = "queued", "Checkpointed during background service shutdown"
                     else:
@@ -2361,6 +2503,7 @@ class Runner:
             add_event("success", f"{job['capture_name']} / {job['strategy_name']}: {imported} recovered, {attempts_recorded} network attempt(s) remembered, {skipped} skipped")
         except Exception as exc:
             with db() as connection:
+                stop_job_clock(connection, job_id)
                 connection.execute("UPDATE jobs SET status='blocked',error=?,finished_at=? WHERE id=?", (str(exc), now(), job_id))
             add_event("error", f"Job {job_id}: {exc}")
         finally:
@@ -2477,6 +2620,10 @@ class Runner:
             return False
         status = {"pause": "paused", "resume": "running", "cancel": "cancelled"}[action]
         with db() as connection:
+            if action == "resume":
+                start_job_clock(connection, job_id)
+            else:
+                stop_job_clock(connection, job_id)
             connection.execute("UPDATE jobs SET status=?,finished_at=CASE WHEN ?='cancelled' THEN ? ELSE finished_at END WHERE id=?",
                                (status, status, now(), job_id))
         return True
@@ -2588,6 +2735,7 @@ class Runner:
                 except subprocess.TimeoutExpired:
                     process.terminate()
             with db() as connection:
+                stop_job_clock(connection, job_id)
                 connection.execute("UPDATE jobs SET status='queued',error='Saved for resume after shutdown' WHERE id=? AND status IN ('running','paused')", (job_id,))
 
 
@@ -2753,6 +2901,25 @@ app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
 
+def session_secret() -> bytes:
+    path = DATA / "session-secret.bin"
+    try:
+        value = path.read_bytes()
+        if len(value) >= 32:
+            return value
+    except OSError:
+        pass
+    value = secrets.token_bytes(48)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_bytes(value)
+    os.replace(temporary, path)
+    return value
+
+
+app.secret_key = session_secret()
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", PERMANENT_SESSION_LIFETIME=timedelta(days=7))
+
+
 def browser_config() -> dict:
     config = load_config()
     config["remote_password_configured"] = bool(config.get("remote_password_hash"))
@@ -2768,8 +2935,14 @@ def private_client(address: str | None) -> bool:
         return False
 
 
-def remote_credentials_valid() -> bool:
+def remote_password_valid(username: str, password: str) -> bool:
     config = load_config()
+    expected_user = str(config.get("remote_username") or "newfpv")
+    password_hash = str(config.get("remote_password_hash") or "")
+    return bool(password_hash and secrets.compare_digest(username, expected_user) and check_password_hash(password_hash, password))
+
+
+def remote_credentials_valid() -> bool:
     header = request.headers.get("Authorization", "")
     if not header.startswith("Basic "):
         return False
@@ -2777,28 +2950,81 @@ def remote_credentials_valid() -> bool:
         username, password = base64.b64decode(header[6:], validate=True).decode("utf-8").split(":", 1)
     except (ValueError, UnicodeDecodeError, binascii.Error):
         return False
-    expected_user = str(config.get("remote_username") or "newfpv")
+    return remote_password_valid(username, password)
+
+
+def effective_client_address() -> str:
+    forwarded = ""
+    if private_client(request.remote_addr):
+        forwarded = str(request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+    return forwarded or str(request.remote_addr or "")
+
+
+def remote_session_valid() -> bool:
+    config = load_config()
     password_hash = str(config.get("remote_password_hash") or "")
-    return bool(password_hash and secrets.compare_digest(username, expected_user) and check_password_hash(password_hash, password))
+    expected = hashlib.sha256(password_hash.encode("utf-8")).hexdigest() if password_hash else ""
+    return bool(session.get("remote_authenticated") and expected and secrets.compare_digest(str(session.get("remote_auth_version") or ""), expected))
 
 
 @app.before_request
 def protect_public_web_access():
-    forwarded = ""
-    if private_client(request.remote_addr):
-        forwarded = str(request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
-    effective_client = forwarded or request.remote_addr
-    if private_client(effective_client) or request.path.startswith("/api/lan/") or request.path == "/health":
+    effective_client = effective_client_address()
+    if private_client(effective_client) or request.path.startswith("/api/lan/") or request.path in {"/health", "/login"} or request.path.startswith("/static/"):
         return None
     config = load_config()
-    if not config.get("remote_access_enabled") or not remote_credentials_valid():
-        return ("Handshake Lab remote access requires authentication.", 401,
-                {"WWW-Authenticate": 'Basic realm="Handshake Lab", charset="UTF-8"', "Cache-Control": "no-store"})
+    authenticated = remote_session_valid() or remote_credentials_valid()
+    if not config.get("remote_access_enabled") or not authenticated:
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "Remote session expired", "login": "/login"}), 401
+        destination = request.full_path if request.query_string else request.path
+        return redirect(url_for("remote_login", next=destination))
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
         origin = request.headers.get("Origin")
         if origin and urllib.parse.urlsplit(origin).netloc != request.host:
             return jsonify({"error": "Cross-origin remote write blocked"}), 403
     return None
+
+
+@app.route("/login", methods=["GET", "POST"])
+def remote_login():
+    config = load_config()
+    if not config.get("remote_access_enabled") and not private_client(effective_client_address()):
+        return render_template("login.html", error="Remote access is disabled.", username="", next_path="/"), 403
+    destination = str(request.values.get("next") or "/")
+    if not destination.startswith("/") or destination.startswith("//"):
+        destination = "/"
+    error = ""
+    username = str(request.form.get("username") or "")
+    if request.method == "POST":
+        client = effective_client_address()
+        timestamp = time.time()
+        with LOGIN_ATTEMPT_LOCK:
+            recent = [value for value in LOGIN_ATTEMPTS.get(client, []) if timestamp - value < 300]
+            LOGIN_ATTEMPTS[client] = recent
+        if len(recent) >= 10:
+            error = "Too many attempts. Wait five minutes and try again."
+        elif remote_password_valid(username, str(request.form.get("password") or "")):
+            password_hash = str(config.get("remote_password_hash") or "")
+            session.clear()
+            session.permanent = True
+            session["remote_authenticated"] = True
+            session["remote_auth_version"] = hashlib.sha256(password_hash.encode("utf-8")).hexdigest()
+            with LOGIN_ATTEMPT_LOCK:
+                LOGIN_ATTEMPTS.pop(client, None)
+            return redirect(destination)
+        else:
+            with LOGIN_ATTEMPT_LOCK:
+                LOGIN_ATTEMPTS.setdefault(client, []).append(timestamp)
+            error = "Incorrect username or password."
+            time.sleep(0.35)
+    return render_template("login.html", error=error, username=username, next_path=destination)
+
+
+@app.get("/logout")
+def remote_logout():
+    session.clear()
+    return redirect(url_for("remote_login"))
 
 
 def benchmark_task(previous_queue_pause: bool) -> None:
@@ -2848,7 +3074,7 @@ runner = Runner()
 
 @app.get("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", remote_session=remote_session_valid())
 
 
 @app.get("/favicon.ico")
@@ -3189,6 +3415,7 @@ def set_global_queue_paused(paused: bool) -> dict:
     jobs = runner.pause_all() if paused else runner.resume_all()
     with db() as connection:
         if paused:
+            stop_job_clocks(connection, ("lan_running",))
             connection.execute("UPDATE jobs SET status='lan_paused',remote_command='pause' WHERE status='lan_running'")
         else:
             connection.execute("UPDATE jobs SET status='lan_running',remote_command='resume' WHERE status='lan_paused'")
@@ -3457,7 +3684,7 @@ def control_job(job_id: int, action: str):
             next_position = connection.execute("SELECT COALESCE(MAX(position),0)+1 FROM jobs").fetchone()[0]
             changed = connection.execute("""UPDATE jobs SET status='queued',progress=0,speed='',speed_hps=0,recovered=0,
                 candidates_done=0,candidates_total=0,eta='',error='',started_at=NULL,finished_at=NULL,
-                worker_name='',remote_command='',position=? WHERE id=? AND status IN ('failed','blocked','cancelled')""",
+                elapsed_seconds=0,active_started_at=NULL,worker_name='',remote_command='',position=? WHERE id=? AND status IN ('failed','blocked','cancelled')""",
                 (next_position, job_id)).rowcount
         if not changed:
             return jsonify({"error": "This job is no longer in a retryable state"}), 409
@@ -3467,6 +3694,8 @@ def control_job(job_id: int, action: str):
         if remote and remote["status"] in {"lan_preparing", "lan_running", "lan_paused"}:
             command = action
             target = "lan_paused" if action == "pause" else "lan_running" if action == "resume" else remote["status"]
+            if action in {"pause", "cancel"}:
+                stop_job_clock(connection, job_id)
             connection.execute("UPDATE jobs SET remote_command=?,status=? WHERE id=?", (command, target, job_id))
             return jsonify({"ok": True})
     return jsonify({"ok": runner.control(job_id, action)})
@@ -3820,6 +4049,10 @@ def save_config():
         current["lan_job_timeout"] = max(60, min(int(current.get("lan_job_timeout", 180)), 1800))
         current["telegram_file_intake"] = bool(current.get("telegram_file_intake", False))
         current["remote_access_enabled"] = bool(current.get("remote_access_enabled", False))
+        current["self_signed_https_enabled"] = bool(current.get("self_signed_https_enabled", False))
+        current["https_port"] = max(1, min(int(current.get("https_port", 8788)), 65535))
+        if current["self_signed_https_enabled"] and current["https_port"] == current["port"]:
+            return jsonify({"error": "Self-signed HTTPS must use a different port from the HTTP listener"}), 400
         current["remote_username"] = re.sub(r"[^0-9A-Za-z_.-]", "", str(current.get("remote_username") or "newfpv"))[:64] or "newfpv"
         current["remote_https_url"] = str(current.get("remote_https_url") or "").strip().rstrip("/")
         if current["remote_https_url"]:
@@ -3838,6 +4071,8 @@ def save_config():
         if current["lan_enabled"] and not str(current.get("lan_token") or "").strip():
             current["lan_token"] = secrets.token_urlsafe(32)
         atomic_json(CONFIG_PATH, current)
+    if current.get("self_signed_https_enabled") and not SELF_SIGNED_HTTPS_URL:
+        start_self_signed_https(current)
     return jsonify({"ok": True, "config": browser_config()})
 
 
@@ -3852,7 +4087,7 @@ def test_notification():
                 if channel == "windows":
                     return jsonify({"error": "Windows notifications are available only on Windows"}), 400
             else:
-                send_windows_notification("Test notification", "Windows notifications are configured correctly.")
+                send_windows_notification("TEST ONLY · Handshake Lab", "Notification check completed. No password was recovered.")
                 sent.append("windows")
         if channel in {"telegram", "all"} and config.get("notifications_telegram", False):
             token = str(config.get("telegram_bot_token") or "").strip()
@@ -3888,6 +4123,9 @@ def remote_access_status():
         "public_ip": public_ip,
         "url": str(config.get("remote_https_url") or "") or (f"http://{public_ip}:{port}" if public_ip else ""),
         "https_url": telegram_https_url(config),
+        "self_signed_https_enabled": bool(config.get("self_signed_https_enabled")),
+        "self_signed_https_url": SELF_SIGNED_HTTPS_URL,
+        "https_port": int(config.get("https_port", 8788)),
         "error": error,
         "requires_router_forward": True,
         "tls_recommended": True,
@@ -3989,9 +4227,10 @@ def lan_claim():
             connection.execute("UPDATE lan_workers SET status='idle',current_job_id=NULL,last_seen=? WHERE name=?", (now(), name))
             return jsonify({"job": None})
         job = dict(row)
+        started = now()
         changed = connection.execute(
-            "UPDATE jobs SET status='lan_preparing',worker_name=?,started_at=?,error='' WHERE id=? AND status='queued'",
-            (name, now(), job["id"]),
+            "UPDATE jobs SET status='lan_preparing',worker_name=?,started_at=COALESCE(started_at,?),active_started_at=NULL,error='' WHERE id=? AND status='queued'",
+            (name, started, job["id"]),
         ).rowcount
         if not changed:
             return jsonify({"job": None})
@@ -4003,6 +4242,7 @@ def lan_claim():
         runtime_hash, capture_lookup, _ = prepare_job_hashes(job)
         if not runtime_hash:
             with db() as connection:
+                stop_job_clock(connection, int(job["id"]))
                 connection.execute("UPDATE jobs SET status='complete',progress=100,error='Skipped: recovered or method already tested',finished_at=? WHERE id=?", (now(), job["id"]))
             return jsonify({"job": None})
         cfg = json.loads(job.get("config_json") or "{}")
@@ -4025,6 +4265,7 @@ def lan_claim():
             "sources": sources, "temperature_abort": load_config().get("temperature_abort", 90)}})
     except Exception as exc:
         with db() as connection:
+            stop_job_clock(connection, int(job["id"]))
             connection.execute("UPDATE jobs SET status='blocked',error=?,finished_at=? WHERE id=?", (str(exc), now(), job["id"]))
             connection.execute("UPDATE lan_workers SET status='idle',current_job_id=NULL WHERE name=? AND current_job_id=?", (name, job["id"]))
         return jsonify({"error": str(exc)}), 409
@@ -4041,11 +4282,13 @@ def lan_progress(job_id: int):
     telemetry["sampled_at"] = now()
     telemetry["job_id"] = job_id
     with db() as connection:
-        row = connection.execute("SELECT remote_command,status FROM jobs WHERE id=? AND worker_name=?", (job_id, name)).fetchone()
+        row = connection.execute("SELECT remote_command,status,active_started_at FROM jobs WHERE id=? AND worker_name=?", (job_id, name)).fetchone()
         if not row:
             return jsonify({"command": "cancel"}), 404
         if row["status"] not in {"lan_preparing", "lan_running", "lan_paused"}:
             return jsonify({"command": "cancel", "reason": "job is no longer active"})
+        if row["status"] != "lan_paused" and not row["active_started_at"]:
+            start_job_clock(connection, job_id)
         connection.execute("""UPDATE jobs SET progress=?,speed=?,speed_hps=?,eta=?,recovered=?,candidates_done=?,candidates_total=? WHERE id=?""",
             (float(payload.get("progress") or 0), str(payload.get("speed") or "")[:80], float(payload.get("speed_hps") or 0),
              str(payload.get("eta") or "")[:100], int(payload.get("recovered") or 0), int(payload.get("candidates_done") or 0),
@@ -4084,6 +4327,7 @@ def lan_complete(job_id: int):
     with db() as connection:
         control = connection.execute("SELECT remote_command FROM jobs WHERE id=?", (job_id,)).fetchone()
         status = "cancelled" if control and control[0] == "cancel" else "complete" if code in (0, 1) else "failed"
+        stop_job_clock(connection, job_id)
         if status == "complete" and job["mode"] != "known":
             insert_network_attempts(connection, job, parse_22000(runtime_hash), recovered)
         connection.execute("UPDATE jobs SET status=?,progress=CASE WHEN ?='complete' THEN 100 ELSE progress END,recovered=?,error=?,finished_at=?,remote_command='' WHERE id=?",
@@ -4107,6 +4351,8 @@ def configure_lan_worker(worker_name: str):
             paused = 1 if payload.get("paused") else 0
             updates.append("paused=?"); values.append(paused)
             if worker["current_job_id"]:
+                if paused:
+                    stop_job_clock(connection, int(worker["current_job_id"]))
                 connection.execute(
                     "UPDATE jobs SET status=?,remote_command=? WHERE id=? AND worker_name=? AND status IN ('lan_running','lan_paused')",
                     ("lan_paused" if paused else "lan_running", "pause" if paused else "resume", worker["current_job_id"], name),
@@ -4153,10 +4399,11 @@ def main() -> None:
     (DATA / "server.pid").write_text(str(os.getpid()), encoding="ascii")
     atexit.register(lambda: (DATA / "server.pid").unlink(missing_ok=True))
     runner.start()
+    config = load_config()
+    start_self_signed_https(config)
     telegram_thread = threading.Thread(target=telegram_file_intake_loop, name="telegram-file-intake", daemon=True)
     telegram_thread.start()
     atexit.register(TELEGRAM_INTAKE_STOP.set)
-    config = load_config()
     try:
         from waitress import serve
         serve(app, host=config["host"], port=int(config["port"]), threads=8)

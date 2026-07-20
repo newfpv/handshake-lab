@@ -16,7 +16,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-WORKER_VERSION = "1.3.0"
+WORKER_VERSION = "1.3.1"
 CONFIG_PATH = ROOT / "lan-worker.json"
 RUNTIME = ROOT / "data" / "lan-worker"
 RUNTIME.mkdir(parents=True, exist_ok=True)
