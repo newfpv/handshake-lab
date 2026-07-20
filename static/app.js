@@ -1124,7 +1124,7 @@ $('#saveSettings').onclick = async () => {
   try{
     const result=await api('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     settingsDirty=false;state.config=result.config;$('#remotePassword').value='';
-    button.classList.remove('settings-dirty');button.innerHTML=`${icon('check')}Save`;
+    button.classList.remove('settings-dirty');button.innerHTML=`${icon('check')}Save changes`;
     renderSettings();toast('Settings saved. Restart the app if host or port changed.');await refresh();
   }catch(error){toast(error.message,true)}finally{button.disabled=false}
 };

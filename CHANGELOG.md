@@ -2,6 +2,11 @@
 
 All notable changes to NewFPV Handshake Lab are documented here.
 
+## 1.2.3 — 2026-07-20
+
+- Kept Save changes visible as a floating Settings action on desktop and above the mobile navigation dock.
+- Fixed notification and Remote Web checkbox labels running into their descriptions.
+
 ## 1.2.2 — 2026-07-20
 
 - Prevented the three-second dashboard refresh from overwriting unsaved Settings fields and checkboxes.

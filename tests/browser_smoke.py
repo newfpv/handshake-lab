@@ -133,6 +133,9 @@ def main():
         preserved = driver.execute_async_script("const done=arguments[0];setTimeout(()=>done(['telegramNotifications','remoteAccessEnabled'].every(id=>document.getElementById(id).checked)),3500)")
         if not preserved:
             raise AssertionError("Background refresh overwrote unsaved settings")
+        save_button_position = driver.execute_script("window.scrollTo(0,document.documentElement.scrollHeight);const r=document.getElementById('saveSettings').getBoundingClientRect();return {position:getComputedStyle(document.getElementById('saveSettings')).position,top:r.top,bottom:r.bottom,height:innerHeight}")
+        if save_button_position["position"] != "fixed" or save_button_position["top"] < 0 or save_button_position["bottom"] > save_button_position["height"]:
+            raise AssertionError(f"Save changes is not visible while Settings is scrolled: {save_button_position}")
         errors = [entry for entry in driver.get_log("browser") if entry["level"] == "SEVERE"]
         if errors:
             raise AssertionError(f"Browser console errors: {errors}")
