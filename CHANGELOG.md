@@ -2,6 +2,15 @@
 
 All notable changes to NewFPV Handshake Lab are documented here.
 
+## 1.2.0 — 2026-07-20
+
+- Replaced checkpoint-based W1–W4 changes with immediate live GPU duty-cycle profiles that preserve the exact running process and position.
+- Added an exclusive WPA 22000 benchmark with persisted on-screen results for meaningful same-system speed comparisons.
+- Added a one-click test for every enabled notification channel.
+- Added allowlisted Telegram document intake for captures, dictionaries and rule files up to 20 MB.
+- Added opt-in authenticated public-IP web access, public-address detection and cross-origin write protection.
+- Updated the built-in Wiki with remote-access, benchmark and Telegram intake guidance.
+
 ## 1.1.0 — 2026-07-20
 
 - Added a streaming Wordlist Analyzer with exact duplicate counting, WPA length validation, progress and GPU-time estimates.

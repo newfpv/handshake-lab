@@ -18,8 +18,12 @@
   "notifications_telegram": false,
   "telegram_bot_token": "",
   "telegram_chat_id": "",
+  "telegram_file_intake": false,
   "notify_password_found": true,
   "notify_overheat": true,
   "notify_worker_error": true,
-  "notify_queue_complete": true
+  "notify_queue_complete": true,
+  "remote_access_enabled": false,
+  "remote_username": "newfpv",
+  "remote_password_hash": ""
 }

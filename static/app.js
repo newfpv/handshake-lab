@@ -84,6 +84,7 @@ let draggedJobId = null;
 let jobDropSide = 'before';
 let telemetryHoverIndex = null;
 let doctorState = null;
+let benchmarkTimer = null;
 const accents = [
   ['cyan','#20e4f4','32,228,244'],
   ['violet','#9f7cff','159,124,255'],
@@ -118,6 +119,7 @@ function navigate(page){
   $$('[data-nav]').forEach(el => el.classList.toggle('active', el.dataset.nav === page));
   const labels = {dashboard:'Overview',captures:'Captures',wordlists:'Candidate sources',pipeline:'Recovery pipeline',queue:'GPU queue',results:'Recovered keys',help:'Help & Wiki',settings:'Settings'};
   $('#pageTitle').textContent = labels[page] || page;
+  if(page==='settings')pollBenchmark();
   scrollTo({top:0,behavior:'smooth'});
 }
 
@@ -539,16 +541,35 @@ function renderSettings(){
   $('#telegramNotifications').checked = Boolean(state.config.notifications_telegram);
   $('#telegramBotToken').value = state.config.telegram_bot_token || '';
   $('#telegramChatId').value = state.config.telegram_chat_id || '';
+  $('#telegramFileIntake').checked = Boolean(state.config.telegram_file_intake);
   $('#notifyPassword').checked = state.config.notify_password_found !== false;
   $('#notifyOverheat').checked = state.config.notify_overheat !== false;
   $('#notifyWorker').checked = state.config.notify_worker_error !== false;
   $('#notifyQueue').checked = state.config.notify_queue_complete !== false;
   $('#telegramBotToken').disabled=!$('#telegramNotifications').checked;
   $('#telegramChatId').disabled=!$('#telegramNotifications').checked;
+  $('#telegramFileIntake').disabled=!$('#telegramNotifications').checked;
+  $('#remoteAccessEnabled').checked=Boolean(state.config.remote_access_enabled);
+  $('#remoteUsername').value=state.config.remote_username||'newfpv';
+  $('#remotePassword').placeholder=state.config.remote_password_configured?'Configured · enter only to replace':'At least 12 characters';
   const workers=onlineLanWorkers();
   const workerList=$('#lanWorkerList');
   workerList.hidden=!workers.length;
   workerList.innerHTML=workers.map(worker=>{const caps=worker.telemetry?.capabilities||{};return `<article><i class="${esc(worker.status)}"></i><span><b>${esc(worker.name)}</b><small>${esc(worker.gpu_name||'GPU worker')} · ${caps.cpu_available?'CPU ready':'GPU only'} · ${esc(worker.status)} · ${fmtDate(worker.last_seen)}</small></span><em>${worker.current_job_id?`Job #${worker.current_job_id}`:'Idle'}</em></article>`}).join('');
+}
+
+function renderBenchmark(result){
+  const box=$('#benchmarkStatus');
+  box.className=`benchmark-status ${result.status||'idle'}`;
+  if(result.status==='running')box.innerHTML='<b>Benchmark running…</b><span>Exclusive WPA 22000 W4 measurement in progress.</span>';
+  else if(result.status==='complete')box.innerHTML=`<b>${esc(result.speed)}</b><span>Measured locally · ${esc(fmtDate(result.finished_at))}</span>`;
+  else if(result.status==='failed')box.innerHTML=`<b>Benchmark failed</b><span>${esc(result.error)}</span>`;
+  else box.innerHTML='<b>WPA 22000 benchmark</b><span>Requires an idle GPU and takes about 20 seconds.</span>';
+}
+
+async function pollBenchmark(){
+  clearTimeout(benchmarkTimer);
+  try{const result=await api('/api/benchmark');renderBenchmark(result);if(result.status==='running')benchmarkTimer=setTimeout(pollBenchmark,1000)}catch(error){toast(error.message,true)}
 }
 
 function renderDoctor(report){
@@ -998,7 +1019,7 @@ $('#pauseLocalGpu').onclick=async()=>{
 };
 $('#liveWorkload').onchange=async event=>{
   const select=event.target,workload=Number(select.value);select.disabled=true;
-  try{const result=await api('/api/queue/workload',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({workload})});await refresh();toast(result.restarting_jobs.length?`Switching active job to W${workload} from its checkpoint`:`Queue profile changed to W${workload}`)}catch(error){toast(error.message,true)}finally{select.disabled=false}
+  try{const result=await api('/api/queue/workload',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({workload})});await refresh();toast(result.live_jobs?.length?`W${workload} applied instantly · position preserved`:`Queue profile changed to W${workload}`)}catch(error){toast(error.message,true)}finally{select.disabled=false}
 };
 $('#lanGpuConsoles').addEventListener('change',async event=>{
   const card=event.target.closest('[data-worker]');if(!card)return;
@@ -1007,7 +1028,7 @@ $('#lanGpuConsoles').addEventListener('change',async event=>{
   if(event.target.classList.contains('remote-cpu-profile'))payload={cpu_profile:event.target.value};
   if(!payload)return;
   event.target.disabled=true;
-  try{const result=await api(`/api/lan/workers/${encodeURIComponent(card.dataset.worker)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});await refresh();toast(`${card.dataset.worker}: profile saved${result.active_profile_applies_next_job?' · applies from the next job':''}`)}catch(error){toast(error.message,true)}finally{event.target.disabled=false}
+  try{const result=await api(`/api/lan/workers/${encodeURIComponent(card.dataset.worker)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});await refresh();toast(`${card.dataset.worker}: profile saved${result.gpu_profile_live?' · GPU changed live':''}${result.cpu_profile_applies_next_job?' · CPU applies next job':''}`)}catch(error){toast(error.message,true)}finally{event.target.disabled=false}
 });
 $('#lanGpuConsoles').addEventListener('click',async event=>{
   const button=event.target.closest('.remote-pause'),card=event.target.closest('[data-worker]');if(!button||!card)return;
@@ -1087,15 +1108,18 @@ $('#startQueue').onclick = async () => {
 };
 
 $('#saveSettings').onclick = async () => {
-  const payload = {hashcat_path:$('#hashcatPath').value.trim(),hcxpcapngtool_path:$('#hcxPath').value.trim(),host:$('#hostSetting').value.trim(),port:Number($('#portSetting').value),max_workers:Number($('#workerSetting').value),workload_profile:Number($('#workloadSetting').value),temperature_abort:Number($('#temperatureSetting').value),lan_enabled:$('#lanEnabled').checked,lan_token:$('#lanToken').value.trim(),lan_job_timeout:Number($('#lanTimeout').value),notifications_windows:$('#windowsNotifications').checked,notifications_telegram:$('#telegramNotifications').checked,telegram_bot_token:$('#telegramBotToken').value.trim(),telegram_chat_id:$('#telegramChatId').value.trim(),notify_password_found:$('#notifyPassword').checked,notify_overheat:$('#notifyOverheat').checked,notify_worker_error:$('#notifyWorker').checked,notify_queue_complete:$('#notifyQueue').checked};
+  const payload = {hashcat_path:$('#hashcatPath').value.trim(),hcxpcapngtool_path:$('#hcxPath').value.trim(),host:$('#hostSetting').value.trim(),port:Number($('#portSetting').value),max_workers:Number($('#workerSetting').value),workload_profile:Number($('#workloadSetting').value),temperature_abort:Number($('#temperatureSetting').value),lan_enabled:$('#lanEnabled').checked,lan_token:$('#lanToken').value.trim(),lan_job_timeout:Number($('#lanTimeout').value),notifications_windows:$('#windowsNotifications').checked,notifications_telegram:$('#telegramNotifications').checked,telegram_bot_token:$('#telegramBotToken').value.trim(),telegram_chat_id:$('#telegramChatId').value.trim(),telegram_file_intake:$('#telegramFileIntake').checked,notify_password_found:$('#notifyPassword').checked,notify_overheat:$('#notifyOverheat').checked,notify_worker_error:$('#notifyWorker').checked,notify_queue_complete:$('#notifyQueue').checked,remote_access_enabled:$('#remoteAccessEnabled').checked,remote_username:$('#remoteUsername').value.trim(),remote_password:$('#remotePassword').value};
   try{ await api('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); toast('Settings saved. Restart the app if host or port changed.'); await refresh(); }catch(error){toast(error.message,true)}
 };
 
 $('#runDoctor').onclick=event=>runDoctor(event.currentTarget);
 $('#doctorFixAll').onclick=event=>applyDoctor('all',event.currentTarget);
-$('#telegramNotifications').onchange=event=>{$('#telegramBotToken').disabled=!event.target.checked;$('#telegramChatId').disabled=!event.target.checked};
+$('#telegramNotifications').onchange=event=>{$('#telegramBotToken').disabled=!event.target.checked;$('#telegramChatId').disabled=!event.target.checked;$('#telegramFileIntake').disabled=!event.target.checked};
 $('#testWindowsNotification').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{await api('/api/notifications/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'windows'})});toast('Windows test notification sent')}catch(error){toast(error.message,true)}finally{button.disabled=false}};
 $('#testTelegramNotification').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{await api('/api/notifications/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'telegram'})});toast('Telegram test message sent')}catch(error){toast(error.message,true)}finally{button.disabled=false}};
+$('#testAllNotifications').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{const result=await api('/api/notifications/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'all'})});toast(`Test sent: ${result.sent.join(' + ')}`)}catch(error){toast(error.message,true)}finally{button.disabled=false}};
+$('#runBenchmark').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{await api('/api/benchmark',{method:'POST'});toast('WPA 22000 benchmark started');pollBenchmark()}catch(error){toast(error.message,true)}finally{button.disabled=false}};
+$('#checkPublicAddress').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{const result=await api('/api/remote/status');const box=$('#remoteStatus');box.innerHTML=result.public_ip?`<b>${esc(result.url)}</b><span>${result.enabled&&result.listening_publicly?'Listener ready; router forwarding and HTTPS are still required.':'Enable remote access, save and restart before forwarding the port.'}</span>`:`<b>Public address unavailable</b><span>${esc(result.error||'Check the internet connection.')}</span>`}catch(error){toast(error.message,true)}finally{button.disabled=false}};
 
 $('#liveCpuProfile').onchange = async event => {
   const previous=state.config.cpu_profile||'off',profile=event.target.value;

@@ -1,6 +1,6 @@
 # Handshake Lab
 
-![Release](https://img.shields.io/badge/release-1.1.0-20e4f4?style=flat-square)
+![Release](https://img.shields.io/badge/release-1.2.0-20e4f4?style=flat-square)
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-20e4f4?style=flat-square)
 ![Local first](https://img.shields.io/badge/data-local%20only-30e37b?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-f4f6f7?style=flat-square)
@@ -20,7 +20,9 @@ A local-first control room for authorized WPA/WPA2 credential audits. Import cap
 - **Wordlist Analyzer.** Stream multi-gigabyte dictionaries and count WPA-ready candidates, duplicates, short lines and estimated GPU time.
 - **One-click Error Doctor.** Recognize missing tools/files, CUDA RTC, VRAM, OpenCL and damaged capture failures with safe fixes.
 - **Real observability.** Speed, ETA, GPU load, temperature, VRAM, power, clock and fan history.
+- **Instant live GPU profiles.** Switch W1–W4 without restarting Hashcat or losing the current candidate position.
 - **Useful notifications.** Optional Windows and Telegram alerts for recovered keys, heat, worker failures and completed queues.
+- **Controlled remote intake.** An approved Telegram chat can import small captures and candidate files; authenticated public-IP web access is opt-in.
 - **Two-PC mode.** Authenticated LAN workers use separate queues, telemetry, pause controls and power profiles.
 - **Crash-aware storage.** SQLite WAL/FULL writes, flushed result exports, Hashcat restore sessions and portable backups.
 - **Private by default.** The UI has no CDN, analytics or remote fonts. Captures and recovered keys stay local; Telegram is completely inactive unless explicitly configured.

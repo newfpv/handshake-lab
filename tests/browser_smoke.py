@@ -126,6 +126,9 @@ def main():
         WebDriverWait(driver, 10).until(lambda browser: browser.find_element("id", "runDoctor").is_displayed())
         if not driver.find_element("id", "windowsNotifications").is_displayed() or not driver.find_element("id", "telegramNotifications").is_displayed():
             raise AssertionError("Notification settings are missing")
+        for control_id in ("testAllNotifications", "runBenchmark", "telegramFileIntake", "remoteAccessEnabled", "checkPublicAddress"):
+            if not driver.find_element("id", control_id).is_displayed():
+                raise AssertionError(f"Settings control is missing: {control_id}")
         errors = [entry for entry in driver.get_log("browser") if entry["level"] == "SEVERE"]
         if errors:
             raise AssertionError(f"Browser console errors: {errors}")

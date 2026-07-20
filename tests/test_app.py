@@ -1,5 +1,6 @@
 import io
 import csv
+import base64
 import tempfile
 import unittest
 import subprocess
@@ -133,6 +134,19 @@ class AuditAppTests(unittest.TestCase):
         with audit.db() as connection:
             worker = connection.execute("SELECT name,gpu_name,status FROM lan_workers").fetchone()
         self.assertEqual(tuple(worker), ("pc-2", "RTX test", "idle"))
+
+    def test_public_web_requires_configured_basic_auth(self):
+        saved = self.client.put("/api/config", json={
+            "remote_access_enabled": True, "remote_username": "owner", "remote_password": "correct-horse-123"
+        })
+        self.assertEqual(saved.status_code, 200)
+        denied = self.client.get("/api/state", environ_base={"REMOTE_ADDR": "8.8.8.8"})
+        self.assertEqual(denied.status_code, 401)
+        credentials = base64.b64encode(b"owner:correct-horse-123").decode("ascii")
+        allowed = self.client.get("/api/state", headers={"Authorization": f"Basic {credentials}"},
+                                  environ_base={"REMOTE_ADDR": "8.8.8.8"})
+        self.assertEqual(allowed.status_code, 200)
+        self.assertNotIn("remote_password_hash", allowed.get_json()["config"])
 
     def test_lan_worker_reports_idle_telemetry(self):
         self.client.put("/api/config", json={"lan_enabled": True, "lan_token": "test-lan-token"})
@@ -334,6 +348,7 @@ class AuditAppTests(unittest.TestCase):
         }, Path(self.temp.name) / "found.txt")
         self.assertNotIn("--restore-timer", command)
         self.assertIn("--restore-file-path", command)
+        self.assertEqual(command[command.index("--workload-profile") + 1], "4")
 
     def test_global_queue_pause_and_workload_are_persistent(self):
         with audit.db() as connection:

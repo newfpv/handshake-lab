@@ -16,7 +16,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-WORKER_VERSION = "1.0.0"
+WORKER_VERSION = "1.2.0"
 CONFIG_PATH = ROOT / "lan-worker.json"
 RUNTIME = ROOT / "data" / "lan-worker"
 RUNTIME.mkdir(parents=True, exist_ok=True)
@@ -185,7 +185,7 @@ def run_job(config: dict, job: dict) -> None:
     log_file = folder / "hashcat.log"
     command = [str(hashcat_path(config)), "-m", "22000", str(hash_file), "--potfile-path", str(ROOT / "data" / "lan-worker.potfile"),
         "--session", f"lan-{job['session']}", "--outfile", str(outfile), "--outfile-format", "1,2", "--separator", "|",
-        "--status", "--status-json", "--status-timer", "2", "--workload-profile", str(job.get("workload", 3)),
+        "--status", "--status-json", "--status-timer", "2", "--workload-profile", "4",
         "--hwmon-temp-abort", str(job.get("temperature_abort", 90))]
     if config.get("force_opencl", False): command.append("--backend-ignore-cuda")
     cpu_profile = str(job.get("cpu_profile") or "off")
@@ -205,14 +205,36 @@ def run_job(config: dict, job: dict) -> None:
     process = subprocess.Popen(command, cwd=str(hashcat_path(config).parent), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, creationflags=flags)
     apply_affinity(process, cpu_profile)
-    runtime = {"last": {"name": config["worker_name"], "telemetry": {"capabilities": config.get("_capabilities") or {}}}, "paused": False}
+    runtime = {"last": {"name": config["worker_name"], "telemetry": {"capabilities": config.get("_capabilities") or {}}},
+               "paused": False, "workload": max(1, min(int(job.get("workload", 3)), 4)), "throttle_suspended": False}
     controller_stop = threading.Event()
 
+    def throttle_loop() -> None:
+        duty_cycles = {1: 0.35, 2: 0.60, 3: 0.85, 4: 1.0}
+        period = 0.40
+        while process.poll() is None and not controller_stop.is_set():
+            if runtime["paused"]:
+                runtime["throttle_suspended"] = False
+                controller_stop.wait(0.08)
+                continue
+            duty = duty_cycles.get(int(runtime["workload"]), 1.0)
+            if runtime["throttle_suspended"]:
+                set_suspended(process, False); runtime["throttle_suspended"] = False
+            if duty >= 1.0:
+                controller_stop.wait(0.08); continue
+            if controller_stop.wait(period * duty): break
+            if not runtime["paused"] and process.poll() is None:
+                runtime["throttle_suspended"] = set_suspended(process, True)
+            if controller_stop.wait(period * (1.0 - duty)): break
+        if runtime["throttle_suspended"] and not runtime["paused"] and process.poll() is None:
+            set_suspended(process, False); runtime["throttle_suspended"] = False
+
     def control_loop() -> None:
-        while not controller_stop.wait(2):
+        while not controller_stop.wait(0.5):
             try:
                 reply = api(config, f"/api/lan/jobs/{job_id}/progress", dict(runtime["last"]))
                 action = reply.get("command")
+                runtime["workload"] = max(1, min(int(reply.get("workload", runtime["workload"])), 4))
                 if action == "cancel":
                     if runtime["paused"]: set_suspended(process, False); runtime["paused"] = False
                     process.terminate()
@@ -224,7 +246,8 @@ def run_job(config: dict, job: dict) -> None:
                 pass
 
     controller = threading.Thread(target=control_loop, name=f"job-{job_id}-control", daemon=True)
-    controller.start()
+    throttle = threading.Thread(target=throttle_loop, name=f"job-{job_id}-live-profile", daemon=True)
+    controller.start(); throttle.start()
     with log_file.open("a", encoding="utf-8") as log:
         for line in iter(process.stdout.readline, ""):
             log.write(line); log.flush()
@@ -248,7 +271,7 @@ def run_job(config: dict, job: dict) -> None:
                 except (ValueError, KeyError, urllib.error.URLError):
                     pass
     code = process.wait()
-    controller_stop.set(); controller.join(timeout=3)
+    controller_stop.set(); controller.join(timeout=3); throttle.join(timeout=3)
     api(config, f"/api/lan/jobs/{job_id}/complete", {"name": config["worker_name"], "exit_code": code,
         "outfile": outfile.read_text(encoding="utf-8", errors="replace") if outfile.is_file() else "",
         "log": log_file.read_text(encoding="utf-8", errors="replace")[-200000:]})

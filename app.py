@@ -3,9 +3,12 @@ from __future__ import annotations
 import csv
 import ctypes
 import atexit
+import base64
+import binascii
 import html
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
@@ -25,6 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, send_file
+from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 
@@ -51,6 +55,11 @@ WORDLIST_ANALYSIS_LOCK = threading.Lock()
 WORDLIST_ANALYSIS_ACTIVE: set[int] = set()
 NOTIFICATION_LOCK = threading.Lock()
 NOTIFICATION_LAST_SENT: dict[str, float] = {}
+BENCHMARK_LOCK = threading.Lock()
+BENCHMARK_STATE: dict[str, object] = {"status": "idle", "speed": "", "speed_hps": 0.0, "output": "", "error": ""}
+BENCHMARK_PATH = DATA / "benchmark.json"
+TELEGRAM_INTAKE_STOP = threading.Event()
+TELEGRAM_OFFSET_PATH = DATA / "telegram-update-offset.txt"
 ALLOWED_CAPTURES = {".22000", ".hc22000", ".pcap", ".pcapng", ".cap"}
 ALLOWED_WORDLISTS = {".txt", ".dic", ".dict", ".lst", ".wordlist"}
 ALLOWED_RULES = {".rule"}
@@ -103,10 +112,14 @@ def default_config() -> dict:
         "notifications_telegram": False,
         "telegram_bot_token": "",
         "telegram_chat_id": "",
+        "telegram_file_intake": False,
         "notify_password_found": True,
         "notify_overheat": True,
         "notify_worker_error": True,
         "notify_queue_complete": True,
+        "remote_access_enabled": False,
+        "remote_username": "newfpv",
+        "remote_password_hash": "",
         "workspace_root": str(ROOT),
     }
 
@@ -1237,6 +1250,82 @@ def send_telegram_notification(token: str, chat_id: str, title: str, message: st
             raise OSError(f"Telegram returned HTTP {response.status}")
 
 
+def telegram_api(token: str, method: str, fields: dict | None = None, timeout: int = 25) -> dict:
+    query = urllib.parse.urlencode(fields or {})
+    url = f"https://api.telegram.org/bot{token}/{method}" + (f"?{query}" if query else "")
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not payload.get("ok"):
+        raise OSError(str(payload.get("description") or f"Telegram {method} failed"))
+    return payload
+
+
+def import_telegram_document(filename: str, content: bytes) -> tuple[int, dict]:
+    suffix = Path(filename).suffix.lower()
+    endpoint = "/api/captures" if suffix in ALLOWED_CAPTURES else "/api/wordlists"
+    handler = upload_captures if suffix in ALLOWED_CAPTURES else upload_wordlists
+    with app.test_request_context(endpoint, method="POST", data={"files": (io.BytesIO(content), filename)}):
+        result = handler()
+    response, status = result if isinstance(result, tuple) else (result, 200)
+    return int(status), response.get_json()
+
+
+def telegram_file_intake_loop() -> None:
+    offset = 0
+    try:
+        if TELEGRAM_OFFSET_PATH.is_file():
+            offset = int(TELEGRAM_OFFSET_PATH.read_text(encoding="ascii").strip() or 0)
+    except (OSError, ValueError):
+        offset = 0
+    while not TELEGRAM_INTAKE_STOP.is_set():
+        config = load_config()
+        token = str(config.get("telegram_bot_token") or "").strip()
+        allowed_chat = str(config.get("telegram_chat_id") or "").strip()
+        if not (config.get("notifications_telegram") and config.get("telegram_file_intake") and token and allowed_chat):
+            TELEGRAM_INTAKE_STOP.wait(3)
+            continue
+        try:
+            updates = telegram_api(token, "getUpdates", {"offset": offset, "timeout": 15, "allowed_updates": json.dumps(["message"])}, 22)
+            for update in updates.get("result") or []:
+                offset = max(offset, int(update.get("update_id", 0)) + 1)
+                message = update.get("message") or {}
+                chat_id = str((message.get("chat") or {}).get("id") or "")
+                document = message.get("document") or {}
+                if chat_id != allowed_chat or not document:
+                    continue
+                filename = secure_filename(str(document.get("file_name") or "telegram-upload"))
+                suffix = Path(filename).suffix.lower()
+                if suffix not in ALLOWED_CAPTURES | ALLOWED_WORDLISTS | ALLOWED_RULES:
+                    send_telegram_notification(token, allowed_chat, "File rejected", "Use a capture, WPA 22000, dictionary or Hashcat .rule file.")
+                    continue
+                size = int(document.get("file_size") or 0)
+                if size <= 0 or size > 20 * 1024 * 1024:
+                    send_telegram_notification(token, allowed_chat, "File rejected", "Telegram intake accepts files up to 20 MB.")
+                    continue
+                file_info = telegram_api(token, "getFile", {"file_id": document.get("file_id")}, 12).get("result") or {}
+                file_path = str(file_info.get("file_path") or "")
+                if not file_path:
+                    raise OSError("Telegram did not return a download path")
+                with urllib.request.urlopen(f"https://api.telegram.org/file/bot{token}/{urllib.parse.quote(file_path)}", timeout=45) as response:
+                    content = response.read(20 * 1024 * 1024 + 1)
+                if len(content) > 20 * 1024 * 1024:
+                    raise OSError("Telegram document exceeded 20 MB")
+                status, result = import_telegram_document(filename, content)
+                imported = result.get("imported") or []
+                errors = result.get("errors") or []
+                detail = f"Imported {len(imported)} item(s)."
+                if errors:
+                    detail += " " + "; ".join(str(item) for item in errors[:3])
+                send_telegram_notification(token, allowed_chat, "Handshake Lab file intake", detail)
+                add_event("success" if status < 400 else "error", f"Telegram intake: {filename}: {detail}")
+            temporary = TELEGRAM_OFFSET_PATH.with_suffix(".tmp")
+            temporary.write_text(str(offset), encoding="ascii")
+            os.replace(temporary, TELEGRAM_OFFSET_PATH)
+        except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as error:
+            add_event("error", f"Telegram intake: {error}")
+            TELEGRAM_INTAKE_STOP.wait(5)
+
+
 def notify_user(kind: str, title: str, message: str, cooldown_key: str = "", cooldown_seconds: int = 0) -> None:
     if globals().get("app") is not None and app.config.get("TESTING"):
         return
@@ -1721,6 +1810,9 @@ class Runner:
     def __init__(self) -> None:
         self.processes: dict[int, subprocess.Popen] = {}
         self.lock = threading.Lock()
+        self.manual_paused: set[int] = set()
+        self.throttle_stops: dict[int, threading.Event] = {}
+        self.live_workload = max(1, min(int(load_config().get("workload_profile", 3)), 4))
         self.stop_event = threading.Event()
         self.shutting_down = threading.Event()
         self.current_telemetry: dict = {}
@@ -1870,15 +1962,15 @@ class Runner:
             raise RuntimeError("Hashcat is not installed. Open Settings and install or select hashcat.exe.")
         restore_path = ROOT / "sessions" / f"{job['session_name']}.restore"
         if restore_path.exists() and restore_path.stat().st_size:
+            self.patch_restore_workload(restore_path, 4)
             return [hashcat, "--session", job["session_name"], "--restore", "--restore-file-path", str(restore_path)]
         cfg = json.loads(job["config_json"] or "{}")
-        workload = max(1, min(int(job.get("workload") or load_config().get("workload_profile", 3)), 4))
         temp_abort = max(70, min(int(load_config().get("temperature_abort", 90)), 100))
         command = [hashcat, "-m", "22000", str(job["hash_path"]), "--potfile-path", str(POTFILE),
                    "--session", job["session_name"], "--restore-file-path", str(restore_path),
                    "--outfile", str(outfile), "--outfile-format", "1,2", "--separator", "|",
                    "--status", "--status-json", "--status-timer", "2",
-                   "--workload-profile", str(workload), "--hwmon-temp-abort", str(temp_abort)]
+                   "--workload-profile", "4", "--hwmon-temp-abort", str(temp_abort)]
         if load_config().get("force_opencl", False):
             command.append("--backend-ignore-cuda")
         cpu_profile = str(job.get("cpu_profile") or load_config().get("cpu_profile", "off"))
@@ -1922,6 +2014,7 @@ class Runner:
 
     def run_job(self, job: dict) -> None:
         job_id = int(job["id"])
+        throttle_stop: threading.Event | None = None
         with self.lock:
             if job_id in self.processes:
                 return
@@ -1938,6 +2031,9 @@ class Runner:
                 add_event("success", f"{job['capture_name']} / {job['strategy_name']}: skipped, already recovered or tested")
                 return
             job["hash_path"] = str(runtime_hash)
+            with self.lock:
+                if not self.processes:
+                    self.live_workload = max(1, min(int(job.get("workload") or 3), 4))
             command = self.build_command(job, outfile)
             if load_config().get("queue_paused", False):
                 return
@@ -1956,6 +2052,13 @@ class Runner:
             apply_cpu_affinity(process, str(job.get("cpu_profile") or "off"))
             with self.lock:
                 self.processes[job_id] = process
+                throttle_stop = threading.Event()
+                self.throttle_stops[job_id] = throttle_stop
+            throttle = threading.Thread(
+                target=self.throttle_process, args=(job_id, process, throttle_stop),
+                name=f"job-{job_id}-live-profile", daemon=True,
+            )
+            throttle.start()
             with log_path.open("a", encoding="utf-8", newline="\n") as log:
                 for line in iter(process.stdout.readline, ""):
                     log.write(line)
@@ -2023,8 +2126,50 @@ class Runner:
             add_event("error", f"Job {job_id}: {exc}")
         finally:
             with self.lock:
+                throttle_stop = self.throttle_stops.pop(job_id, None)
+                if throttle_stop:
+                    throttle_stop.set()
                 self.processes.pop(job_id, None)
+                self.manual_paused.discard(job_id)
                 self.restart_requests.pop(job_id, None)
+
+    def throttle_process(self, job_id: int, process: subprocess.Popen, stop: threading.Event) -> None:
+        """Apply live GPU duty-cycle profiles without restarting Hashcat."""
+        duty_cycles = {1: 0.35, 2: 0.60, 3: 0.85, 4: 1.0}
+        period = 0.40
+        throttle_suspended = False
+        while process.poll() is None and not stop.is_set():
+            with self.lock:
+                manually_paused = job_id in self.manual_paused
+                workload = self.live_workload
+            if manually_paused:
+                throttle_suspended = False
+                stop.wait(0.08)
+                continue
+            duty = duty_cycles.get(workload, 1.0)
+            if throttle_suspended:
+                set_process_suspended(process, False)
+                throttle_suspended = False
+            if duty >= 1.0:
+                stop.wait(0.08)
+                continue
+            if stop.wait(period * duty):
+                break
+            with self.lock:
+                manually_paused = job_id in self.manual_paused
+            if not manually_paused and process.poll() is None:
+                throttle_suspended = set_process_suspended(process, True)
+            if stop.wait(period * (1.0 - duty)):
+                break
+        with self.lock:
+            manually_paused = job_id in self.manual_paused
+        if throttle_suspended and not manually_paused and process.poll() is None:
+            set_process_suspended(process, False)
+
+    def set_live_workload(self, workload: int) -> list[int]:
+        with self.lock:
+            self.live_workload = max(1, min(int(workload), 4))
+            return sorted(self.processes)
 
     def consume_status(self, job_id: int, line: str) -> None:
         line = line.strip()
@@ -2068,16 +2213,28 @@ class Runner:
         if not process or action not in {"pause", "resume", "cancel"}:
             return False
         if action == "pause":
+            with self.lock:
+                self.manual_paused.add(job_id)
             changed = set_process_suspended(process, True)
         elif action == "resume":
+            with self.lock:
+                self.manual_paused.discard(job_id)
             changed = set_process_suspended(process, False)
         else:
             try:
+                with self.lock:
+                    was_paused = job_id in self.manual_paused
+                    self.manual_paused.discard(job_id)
+                if was_paused:
+                    set_process_suspended(process, False)
                 process.terminate()
                 changed = True
             except OSError:
                 changed = False
         if not changed:
+            if action == "pause":
+                with self.lock:
+                    self.manual_paused.discard(job_id)
             return False
         status = {"pause": "paused", "resume": "running", "cancel": "cancelled"}[action]
         with db() as connection:
@@ -2355,6 +2512,90 @@ def enqueue_matrix(connection: sqlite3.Connection, captures: list[dict], stages:
 
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+
+
+def browser_config() -> dict:
+    config = load_config()
+    config["remote_password_configured"] = bool(config.get("remote_password_hash"))
+    config.pop("remote_password_hash", None)
+    return config
+
+
+def private_client(address: str | None) -> bool:
+    try:
+        client = ipaddress.ip_address(str(address or "").split("%")[0])
+        return client.is_loopback or client.is_private or client.is_link_local
+    except ValueError:
+        return False
+
+
+def remote_credentials_valid() -> bool:
+    config = load_config()
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Basic "):
+        return False
+    try:
+        username, password = base64.b64decode(header[6:], validate=True).decode("utf-8").split(":", 1)
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return False
+    expected_user = str(config.get("remote_username") or "newfpv")
+    password_hash = str(config.get("remote_password_hash") or "")
+    return bool(password_hash and secrets.compare_digest(username, expected_user) and check_password_hash(password_hash, password))
+
+
+@app.before_request
+def protect_public_web_access():
+    if private_client(request.remote_addr) or request.path.startswith("/api/lan/") or request.path == "/health":
+        return None
+    config = load_config()
+    if not config.get("remote_access_enabled") or not remote_credentials_valid():
+        return ("Handshake Lab remote access requires authentication.", 401,
+                {"WWW-Authenticate": 'Basic realm="Handshake Lab", charset="UTF-8"', "Cache-Control": "no-store"})
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        origin = request.headers.get("Origin")
+        if origin and urllib.parse.urlsplit(origin).netloc != request.host:
+            return jsonify({"error": "Cross-origin remote write blocked"}), 403
+    return None
+
+
+def benchmark_task(previous_queue_pause: bool) -> None:
+    try:
+        hashcat = executable("hashcat_path", ("hashcat",))
+        if not hashcat:
+            raise OSError("Hashcat is not installed")
+        command = [hashcat, "-b", "-m", "22000", "-w", "4"]
+        completed = subprocess.run(
+            command, cwd=str(Path(hashcat).parent), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=180,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        output = (completed.stdout or "") + (completed.stderr or "")
+        matches = re.findall(r"Speed\.#[^:]*:\s*([0-9.]+)\s*([kMGT]?H/s)", output, re.IGNORECASE)
+        if completed.returncode or not matches:
+            raise OSError(hashcat_failure_message_from_text(output, completed.returncode))
+        value, unit = matches[-1]
+        multipliers = {"h/s": 1, "kh/s": 1_000, "mh/s": 1_000_000, "gh/s": 1_000_000_000, "th/s": 1_000_000_000_000}
+        speed_hps = float(value) * multipliers[unit.lower()]
+        with BENCHMARK_LOCK:
+            BENCHMARK_STATE.update({"status": "complete", "speed": f"{value} {unit}", "speed_hps": speed_hps,
+                                    "output": output[-12000:], "error": "", "finished_at": now()})
+            atomic_json(BENCHMARK_PATH, BENCHMARK_STATE)
+        add_event("success", f"WPA 22000 benchmark completed at {value} {unit}")
+    except (OSError, subprocess.SubprocessError) as error:
+        with BENCHMARK_LOCK:
+            BENCHMARK_STATE.update({"status": "failed", "error": str(error), "finished_at": now()})
+            atomic_json(BENCHMARK_PATH, BENCHMARK_STATE)
+        add_event("error", f"Benchmark failed: {error}")
+    finally:
+        with CONFIG_LOCK:
+            config = load_config()
+            config["queue_paused"] = previous_queue_pause
+            atomic_json(CONFIG_PATH, config)
+
+
+def hashcat_failure_message_from_text(output: str, code: int) -> str:
+    useful = [line.strip() for line in output.splitlines() if line.strip()]
+    return (useful[-1] if useful else f"Hashcat exited with code {code}")[:500]
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024
 init_storage()
 scan_local_sources()
@@ -2469,7 +2710,7 @@ def state():
     converter = executable("hcxpcapngtool_path", ("hcxpcapngtool",))
     backend = hashcat_backend_info()
     return jsonify({"captures": captures, "wordlists": wordlists, "strategies": strategies, "presets": presets, "jobs": jobs,
-                    "results": results, "events": events, "config": load_config(),
+                    "results": results, "events": events, "config": browser_config(),
                     "lan_workers": lan_workers,
                     "telemetry": telemetry, "gpu": runner.current_telemetry, "cpu": system_cpu_sample(),
                     "tools": {"hashcat": hashcat, "hcxpcapngtool": converter, **backend}})
@@ -2489,6 +2730,43 @@ def fix_error_doctor_issue():
         return jsonify({"ok": True, **apply_doctor_fix(action)})
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
+
+
+@app.get("/api/benchmark")
+def benchmark_status():
+    with BENCHMARK_LOCK:
+        if BENCHMARK_STATE.get("status") == "idle" and BENCHMARK_PATH.is_file():
+            try:
+                BENCHMARK_STATE.update(json.loads(BENCHMARK_PATH.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):
+                pass
+        return jsonify(dict(BENCHMARK_STATE))
+
+
+@app.post("/api/benchmark")
+def start_benchmark():
+    with BENCHMARK_LOCK:
+        if BENCHMARK_STATE.get("status") == "running":
+            return jsonify({"error": "A benchmark is already running"}), 409
+    with runner.lock:
+        active = sorted(runner.processes)
+    if active:
+        return jsonify({"error": f"Benchmark needs exclusive GPU access. Finish or cancel active Job #{active[0]} first."}), 409
+    with CONFIG_LOCK:
+        config = load_config()
+        previous_queue_pause = bool(config.get("queue_paused", False))
+        config["queue_paused"] = True
+        atomic_json(CONFIG_PATH, config)
+    with runner.lock:
+        active = sorted(runner.processes)
+    if active:
+        with CONFIG_LOCK:
+            config = load_config(); config["queue_paused"] = previous_queue_pause; atomic_json(CONFIG_PATH, config)
+        return jsonify({"error": f"Benchmark needs exclusive GPU access. Finish or cancel active Job #{active[0]} first."}), 409
+    with BENCHMARK_LOCK:
+        BENCHMARK_STATE.update({"status": "running", "speed": "", "speed_hps": 0.0, "output": "", "error": "", "started_at": now()})
+    threading.Thread(target=benchmark_task, args=(previous_queue_pause,), name="wpa-benchmark", daemon=True).start()
+    return jsonify({"ok": True, "status": "running"}), 202
 
 
 @app.post("/api/captures")
@@ -2708,15 +2986,10 @@ def update_queue_workload():
             "UPDATE jobs SET workload=? WHERE status IN ('queued','running','paused')",
             (workload,),
         ).rowcount
-    restarting = runner.request_workload(workload)
-    if restarting:
-        with db() as connection:
-            connection.executemany(
-                "UPDATE jobs SET error=? WHERE id=?",
-                [(f"Checkpointing to apply W{workload}", job_id) for job_id in restarting],
-            )
-    add_event("info", f"Queue workload changed to W{workload}{'; checkpointing active job' if restarting else ''}")
-    return jsonify({"ok": True, "workload": workload, "updated_jobs": changed, "restarting_jobs": restarting})
+    live_jobs = runner.set_live_workload(workload)
+    add_event("info", f"Live GPU profile changed instantly to W{workload} for {len(live_jobs)} active job(s)")
+    return jsonify({"ok": True, "workload": workload, "updated_jobs": changed, "live_jobs": live_jobs,
+                    "restarting_jobs": []})
 
 
 @app.put("/api/queue/cpu-profile")
@@ -3288,7 +3561,7 @@ def save_config():
     with CONFIG_LOCK:
         current = load_config()
         for key in default_config():
-            if key in payload:
+            if key != "remote_password_hash" and key in payload:
                 current[key] = payload[key]
         current["port"] = max(1, min(int(current["port"]), 65535))
         current["max_workers"] = max(1, min(int(current["max_workers"]), 2))
@@ -3298,32 +3571,74 @@ def save_config():
         current["queue_paused"] = bool(current.get("queue_paused", False))
         current["lan_enabled"] = bool(current.get("lan_enabled", False))
         current["lan_job_timeout"] = max(60, min(int(current.get("lan_job_timeout", 180)), 1800))
+        current["telegram_file_intake"] = bool(current.get("telegram_file_intake", False))
+        current["remote_access_enabled"] = bool(current.get("remote_access_enabled", False))
+        current["remote_username"] = re.sub(r"[^0-9A-Za-z_.-]", "", str(current.get("remote_username") or "newfpv"))[:64] or "newfpv"
+        remote_password = str(payload.get("remote_password") or "")
+        if remote_password:
+            if len(remote_password) < 12:
+                return jsonify({"error": "Remote password must contain at least 12 characters"}), 400
+            current["remote_password_hash"] = generate_password_hash(remote_password)
+        if current["remote_access_enabled"] and not current.get("remote_password_hash"):
+            return jsonify({"error": "Set a remote password before enabling public access"}), 400
+        if current["remote_access_enabled"]:
+            current["host"] = "0.0.0.0"
         if current["lan_enabled"] and not str(current.get("lan_token") or "").strip():
             current["lan_token"] = secrets.token_urlsafe(32)
         atomic_json(CONFIG_PATH, current)
-    return jsonify({"ok": True, "config": current})
+    return jsonify({"ok": True, "config": browser_config()})
 
 
 @app.post("/api/notifications/test")
 def test_notification():
     channel = str((request.get_json(silent=True) or {}).get("channel") or "windows")
     config = load_config()
+    sent: list[str] = []
     try:
-        if channel == "windows":
+        if channel in {"windows", "all"} and config.get("notifications_windows", True):
             if os.name != "nt":
-                return jsonify({"error": "Windows notifications are available only on Windows"}), 400
-            send_windows_notification("Handshake Lab test", "Windows notifications are configured correctly.")
-        elif channel == "telegram":
+                if channel == "windows":
+                    return jsonify({"error": "Windows notifications are available only on Windows"}), 400
+            else:
+                send_windows_notification("Handshake Lab test", "Windows notifications are configured correctly.")
+                sent.append("windows")
+        if channel in {"telegram", "all"} and config.get("notifications_telegram", False):
             token = str(config.get("telegram_bot_token") or "").strip()
             chat_id = str(config.get("telegram_chat_id") or "").strip()
             if not token or not chat_id:
                 return jsonify({"error": "Enter both Telegram bot token and chat ID first"}), 400
             send_telegram_notification(token, chat_id, "Handshake Lab test", "Telegram notifications are configured correctly.")
-        else:
+            sent.append("telegram")
+        if channel not in {"windows", "telegram", "all"}:
             return jsonify({"error": "Unsupported notification channel"}), 400
+        if not sent:
+            return jsonify({"error": "Enable at least one configured notification channel first"}), 400
     except (OSError, urllib.error.URLError, subprocess.SubprocessError) as error:
         return jsonify({"error": str(error)}), 502
-    return jsonify({"ok": True, "channel": channel})
+    return jsonify({"ok": True, "channel": channel, "sent": sent})
+
+
+@app.get("/api/remote/status")
+def remote_access_status():
+    config = load_config()
+    public_ip = ""
+    error = ""
+    try:
+        with urllib.request.urlopen("https://api.ipify.org?format=json", timeout=6) as response:
+            public_ip = str(json.loads(response.read().decode("utf-8")).get("ip") or "")
+    except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as failure:
+        error = str(failure)
+    port = int(config.get("port", 8787))
+    return jsonify({
+        "enabled": bool(config.get("remote_access_enabled")),
+        "password_configured": bool(config.get("remote_password_hash")),
+        "listening_publicly": str(config.get("host")) in {"0.0.0.0", "::"},
+        "public_ip": public_ip,
+        "url": f"http://{public_ip}:{port}" if public_ip else "",
+        "error": error,
+        "requires_router_forward": True,
+        "tls_recommended": True,
+    })
 
 
 def lan_authorized() -> bool:
@@ -3482,13 +3797,13 @@ def lan_progress(job_id: int):
             (float(payload.get("progress") or 0), str(payload.get("speed") or "")[:80], float(payload.get("speed_hps") or 0),
              str(payload.get("eta") or "")[:100], int(payload.get("recovered") or 0), int(payload.get("candidates_done") or 0),
              int(payload.get("candidates_total") or 0), job_id))
-        worker = connection.execute("SELECT paused FROM lan_workers WHERE name=?", (name,)).fetchone()
+        worker = connection.execute("SELECT paused,workload FROM lan_workers WHERE name=?", (name,)).fetchone()
         connection.execute("UPDATE lan_workers SET status='running',current_job_id=?,telemetry_json=?,last_seen=? WHERE name=?",
                            (job_id, json.dumps(telemetry), now(), name))
     command = row["remote_command"] or ("pause" if load_config().get("queue_paused") else "")
     if worker and worker["paused"]:
         command = "pause"
-    return jsonify({"command": command})
+    return jsonify({"command": command, "workload": int(worker["workload"] or 3) if worker else 3})
 
 
 @app.post("/api/lan/jobs/<int:job_id>/complete")
@@ -3555,7 +3870,9 @@ def configure_lan_worker(worker_name: str):
             connection.execute(f"UPDATE lan_workers SET {','.join(updates)} WHERE name=?", (*values, name))
         updated = row_dict(connection.execute("SELECT * FROM lan_workers WHERE name=?", (name,)).fetchone())
     add_event("info", f"LAN worker {name} settings updated")
-    return jsonify({"ok": True, "worker": updated, "active_profile_applies_next_job": bool(worker["current_job_id"] and ("workload" in payload or "cpu_profile" in payload))})
+    return jsonify({"ok": True, "worker": updated,
+                    "gpu_profile_live": bool(worker["current_job_id"] and "workload" in payload),
+                    "cpu_profile_applies_next_job": bool(worker["current_job_id"] and "cpu_profile" in payload)})
 
 
 @app.post("/api/system/shutdown")
@@ -3583,6 +3900,9 @@ def main() -> None:
     (DATA / "server.pid").write_text(str(os.getpid()), encoding="ascii")
     atexit.register(lambda: (DATA / "server.pid").unlink(missing_ok=True))
     runner.start()
+    telegram_thread = threading.Thread(target=telegram_file_intake_loop, name="telegram-file-intake", daemon=True)
+    telegram_thread.start()
+    atexit.register(TELEGRAM_INTAKE_STOP.set)
     config = load_config()
     try:
         from waitress import serve
