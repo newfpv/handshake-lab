@@ -6,6 +6,7 @@ import unittest
 import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
 import app as audit
 
@@ -38,6 +39,39 @@ class AuditAppTests(unittest.TestCase):
         parsed = audit.parse_22000(path)
         self.assertEqual(parsed[0]["essid"], "TestNet")
         self.assertEqual(parsed[0]["bssid"], "001122334455")
+
+    def test_telegram_pcap_document_uses_capture_import_pipeline(self):
+        with mock.patch.object(audit, "upload_captures") as handler:
+            handler.side_effect = lambda: (
+                audit.jsonify({"imported": [{"filename": "sample.PCAP", "networks": 1, "status": "ready"}], "errors": []}),
+                200,
+            )
+            status, result = audit.import_telegram_document("sample.PCAP", b"pcap payload")
+        self.assertEqual(status, 200)
+        self.assertEqual(result["imported"][0]["status"], "ready")
+        handler.assert_called_once_with()
+
+    def test_telegram_panel_has_controls_and_https_web_app(self):
+        config = audit.load_config()
+        config.update({
+            "queue_paused": False,
+            "workload_profile": 3,
+            "remote_access_enabled": True,
+            "remote_https_url": "https://lab.example.com",
+        })
+        audit.atomic_json(audit.CONFIG_PATH, config)
+        keyboard = audit.telegram_keyboard(config)
+        buttons = [button for row in keyboard["inline_keyboard"] for button in row]
+        callbacks = {button.get("callback_data") for button in buttons}
+        self.assertTrue({"hl:status", "hl:queue", "hl:toggle", "hl:results", "hl:upload", "hl:help"}.issubset(callbacks))
+        self.assertTrue({"hl:w1", "hl:w2", "hl:w3", "hl:w4"}.issubset(callbacks))
+        web_button = next(button for button in buttons if "web_app" in button)
+        self.assertEqual(web_button["web_app"]["url"], "https://lab.example.com")
+
+    def test_remote_web_app_rejects_plain_http_url(self):
+        response = self.client.put("/api/config", json={"remote_https_url": "http://lab.example.com"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("HTTPS", response.get_json()["error"])
 
     def test_common_candidates_are_ranked_and_capture_specific(self):
         path = Path(self.temp.name) / "common.22000"

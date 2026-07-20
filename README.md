@@ -1,6 +1,6 @@
 # Handshake Lab
 
-![Release](https://img.shields.io/badge/release-1.2.3-20e4f4?style=flat-square)
+![Release](https://img.shields.io/badge/release-1.3.0-20e4f4?style=flat-square)
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-20e4f4?style=flat-square)
 ![Local first](https://img.shields.io/badge/data-local%20only-30e37b?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-f4f6f7?style=flat-square)
@@ -23,7 +23,7 @@ A local-first control room for authorized WPA/WPA2 credential audits. Import cap
 - **Instant live GPU profiles.** Switch W1–W4 without restarting Hashcat or losing the current candidate position.
 - **Built-in benchmark.** Measure WPA 22000 performance in an exclusive W4 run and keep the latest result for comparison.
 - **Useful notifications.** Native Handshake Lab Windows toasts and optional Telegram alerts for recovered keys, heat, worker failures and completed queues.
-- **Controlled remote intake.** An approved Telegram chat can import small captures and candidate files; authenticated public-IP web access is opt-in.
+- **Telegram control panel.** Inline buttons show GPU/queue status, pause or resume all work, switch live W1–W4 profiles, display recovered keys and import PCAP/candidate files from one approved chat.
 - **Two-PC mode.** Authenticated LAN workers use separate queues, telemetry, pause controls and power profiles.
 - **Crash-aware storage.** SQLite WAL/FULL writes, flushed result exports, Hashcat restore sessions and portable backups.
 - **Private by default.** The UI has no CDN, analytics or remote fonts. Captures and recovered keys stay local; Telegram is completely inactive unless explicitly configured.
@@ -76,7 +76,7 @@ Open **Settings → Audit engine → Benchmark** to run an exclusive Hashcat mod
 
 Windows notifications are local native toasts with the Handshake Lab identity and logo. Telegram is disabled until a bot token and chat ID are saved. **Test alerts** verifies every enabled channel; individual Windows and Telegram test buttons are available beside their settings.
 
-Telegram file intake is separately opt-in. When enabled, the exact configured chat may send captures, dictionaries and `.rule` files up to 20 MB. Files pass through the normal validation and deduplication flow and are never queued automatically.
+Send `/start` to the configured bot for its inline control panel. It provides live status, queue, recovered results, master pause/resume, W1–W4 and upload/help buttons. Telegram file intake is separately opt-in. When enabled, the exact configured chat may send `.pcap`, `.pcapng`, `.cap`, `.22000`, `.hc22000`, dictionaries and `.rule` documents up to 20 MB. PCAP files pass through the normal local conversion, quality and deduplication flow and are never queued automatically.
 
 ### Public-IP web access
 
@@ -84,10 +84,11 @@ Remote access is private and disabled by default. In **Settings → Public-IP ac
 
 1. Set a username and a new password of at least 12 characters.
 2. Enable remote access, save, and restart Handshake Lab if the listener changed.
-3. Press **Check address** to detect the external address.
-4. Forward TCP port `8787` on the router to the coordinator only when direct access is required.
+3. Put the trusted external HTTPS address from your domain, reverse proxy or VPN share into **HTTPS public URL for Telegram Web App**.
+4. Press **Check address**. The bot then adds **Open Handshake Lab** to its inline panel and persistent Telegram menu.
+5. Forward a proxy port on the router only when direct hosting is required; tunnels and VPN shares normally need no inbound forwarding.
 
-Public clients must authenticate with HTTP Basic and cross-origin write requests are rejected. Basic authentication does not encrypt traffic, so use an HTTPS reverse proxy or a private VPN for access outside a trusted network. Handshake Lab never enables UPnP or changes the router automatically.
+Public clients must authenticate with HTTP Basic and cross-origin write requests are rejected. Telegram Mini Apps require a trusted HTTPS URL, so Handshake Lab rejects plain HTTP and embedded credentials in that field. A certificate cannot be created safely from a bare public IP; use a hostname, authenticated tunnel or HTTPS-capable private VPN. Handshake Lab never enables UPnP or changes the router automatically.
 
 ## Requirements
 
@@ -110,7 +111,7 @@ The exhaustive documentation lives inside the app under **Help & Wiki**. It is s
 - local files, backups, restores and PWMenu-compatible `recovered.csv` exports;
 - complete two-computer LAN setup;
 - live W1–W4 behavior and the exclusive WPA benchmark;
-- native Windows alerts, Telegram file intake and notification testing;
+- native Windows alerts, Telegram controls, PCAP intake, Mini App setup and notification testing;
 - authenticated public-IP access, HTTPS/VPN guidance and troubleshooting;
 - Error Doctor diagnostics with exact failure meanings.
 

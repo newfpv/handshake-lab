@@ -2,6 +2,14 @@
 
 All notable changes to NewFPV Handshake Lab are documented here.
 
+## 1.3.0 — 2026-07-20
+
+- Added a Telegram inline control panel with status, queue, results, master pause/resume and instant W1–W4 actions.
+- Registered Telegram slash commands and a persistent Mini App menu button when trusted HTTPS Remote Web is configured.
+- Verified Telegram `.pcap`, `.pcapng`, `.cap`, `.22000` and `.hc22000` uploads use the normal capture conversion, validation and deduplication pipeline.
+- Kept bot controls available independently from the separately opt-in file intake permission.
+- Added strict HTTPS Web App URL validation and forwarded-client authentication behind a local reverse proxy.
+
 ## 1.2.3 — 2026-07-20
 
 - Kept Save changes visible as a floating Settings action on desktop and above the mobile navigation dock.

@@ -120,6 +120,7 @@ def default_config() -> dict:
         "remote_access_enabled": False,
         "remote_username": "newfpv",
         "remote_password_hash": "",
+        "remote_https_url": "",
         "workspace_root": str(ROOT),
     }
 
@@ -1250,25 +1251,205 @@ def send_windows_notification(title: str, message: str) -> None:
         raise OSError(completed.stderr.decode("utf-8", errors="replace")[:300] or "Windows toast command failed")
 
 
-def send_telegram_notification(token: str, chat_id: str, title: str, message: str) -> None:
-    payload = urllib.parse.urlencode({"chat_id": chat_id, "text": f"{title}\n{message}"}).encode("utf-8")
+def telegram_api(token: str, method: str, fields: dict | None = None, timeout: int = 25) -> dict:
+    payload = urllib.parse.urlencode(fields or {}).encode("utf-8")
     request_value = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/sendMessage", data=payload,
+        f"https://api.telegram.org/bot{token}/{method}", data=payload,
         headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST",
     )
-    with urllib.request.urlopen(request_value, timeout=12) as response:
-        if response.status >= 300:
-            raise OSError(f"Telegram returned HTTP {response.status}")
-
-
-def telegram_api(token: str, method: str, fields: dict | None = None, timeout: int = 25) -> dict:
-    query = urllib.parse.urlencode(fields or {})
-    url = f"https://api.telegram.org/bot{token}/{method}" + (f"?{query}" if query else "")
-    with urllib.request.urlopen(url, timeout=timeout) as response:
+    with urllib.request.urlopen(request_value, timeout=timeout) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if not payload.get("ok"):
         raise OSError(str(payload.get("description") or f"Telegram {method} failed"))
     return payload
+
+
+def telegram_send_message(token: str, chat_id: str, text: str, reply_markup: dict | None = None,
+                          message_id: int | None = None) -> dict:
+    fields: dict[str, object] = {"chat_id": chat_id, "text": text[:4096]}
+    if reply_markup:
+        fields["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    method = "sendMessage"
+    if message_id:
+        method = "editMessageText"
+        fields["message_id"] = message_id
+    try:
+        return telegram_api(token, method, fields, 12)
+    except OSError as error:
+        if message_id and "message is not modified" in str(error).lower():
+            return {"ok": True, "result": {}}
+        raise
+
+
+def send_telegram_notification(token: str, chat_id: str, title: str, message: str) -> None:
+    telegram_send_message(token, chat_id, f"{title}\n{message}")
+
+
+def telegram_https_url(config: dict | None = None) -> str:
+    current = config or load_config()
+    if not current.get("remote_access_enabled"):
+        return ""
+    value = str(current.get("remote_https_url") or "").strip().rstrip("/")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return ""
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return ""
+    return value
+
+
+def telegram_keyboard(config: dict | None = None) -> dict:
+    current = config or load_config()
+    paused = bool(current.get("queue_paused"))
+    workload = max(1, min(int(current.get("workload_profile", 3)), 4))
+    profiles = [
+        {"text": ("✓ " if item == workload else "") + f"W{item}", "callback_data": f"hl:w{item}"}
+        for item in range(1, 5)
+    ]
+    rows = [
+        [{"text": "📊 Status", "callback_data": "hl:status"},
+         {"text": "📋 Queue", "callback_data": "hl:queue"}],
+        [{"text": "▶️ Resume all" if paused else "⏸ Pause all", "callback_data": "hl:toggle"},
+         {"text": "🔑 Results", "callback_data": "hl:results"}],
+        profiles,
+        [{"text": "📎 Upload PCAP", "callback_data": "hl:upload"},
+         {"text": "❔ Help", "callback_data": "hl:help"}],
+    ]
+    web_url = telegram_https_url(current)
+    if web_url:
+        rows.append([{"text": "🌐 Open Handshake Lab", "web_app": {"url": web_url}}])
+    elif current.get("remote_access_enabled"):
+        rows.append([{"text": "🌐 Web UI setup", "callback_data": "hl:web"}])
+    return {"inline_keyboard": rows}
+
+
+def telegram_status_text() -> str:
+    config = load_config()
+    with db() as connection:
+        counts = {row["status"]: int(row["amount"]) for row in connection.execute(
+            "SELECT status,COUNT(*) AS amount FROM jobs GROUP BY status"
+        )}
+        captures = int(connection.execute("SELECT COUNT(*) FROM captures").fetchone()[0])
+        recovered = int(connection.execute("SELECT COUNT(*) FROM results").fetchone()[0])
+        current = connection.execute(
+            """SELECT j.id,j.status,j.progress,c.filename,s.name AS strategy_name
+               FROM jobs j JOIN captures c ON c.id=j.capture_id JOIN strategies s ON s.id=j.strategy_id
+               WHERE j.status IN ('running','paused','lan_running','lan_paused') ORDER BY j.id LIMIT 1"""
+        ).fetchone()
+    telemetry = dict(getattr(runner, "current_telemetry", {}) or {})
+    paused = bool(config.get("queue_paused"))
+    workload = max(1, min(int(config.get("workload_profile", 3)), 4))
+    waiting = sum(counts.get(state, 0) for state in ("queued", "running", "paused", "lan_preparing", "lan_running", "lan_paused"))
+    lines = [
+        "HANDSHAKE LAB",
+        f"Engine: {'PAUSED' if paused else ('RUNNING' if current else 'IDLE')} · W{workload}",
+        f"Captures: {captures} · Queue: {waiting} · Recovered: {recovered}",
+    ]
+    if current:
+        lines.append(f"Job #{current['id']} · {current['strategy_name']} · {float(current['progress'] or 0):.2f}%")
+        lines.append(str(current["filename"]))
+    speed = float(telemetry.get("speed_hps") or 0)
+    temperature = telemetry.get("temperature")
+    utilization = telemetry.get("utilization")
+    if speed or temperature is not None or utilization is not None:
+        gpu = []
+        if speed:
+            gpu.append(human_rate(speed))
+        if temperature is not None:
+            gpu.append(f"{float(temperature):.0f}°C")
+        if utilization is not None:
+            gpu.append(f"{float(utilization):.0f}% GPU")
+        lines.append("GPU: " + " · ".join(gpu))
+    return "\n".join(lines)
+
+
+def telegram_queue_text() -> str:
+    active_states = ("running", "paused", "lan_preparing", "lan_running", "lan_paused", "queued")
+    with db() as connection:
+        total = int(connection.execute(
+            f"SELECT COUNT(*) FROM jobs WHERE status IN ({','.join('?' * len(active_states))})", active_states
+        ).fetchone()[0])
+        rows = connection.execute(
+            f"""SELECT j.id,j.status,j.progress,j.eta,c.filename,s.name AS strategy_name
+                FROM jobs j JOIN captures c ON c.id=j.capture_id JOIN strategies s ON s.id=j.strategy_id
+                WHERE j.status IN ({','.join('?' * len(active_states))})
+                ORDER BY CASE WHEN j.status='queued' THEN 1 ELSE 0 END,j.position,j.id LIMIT 8""",
+            active_states,
+        ).fetchall()
+    lines = [f"QUEUE · {total} active/waiting"]
+    if not rows:
+        lines.append("Nothing is waiting. Build a pipeline in the web UI.")
+    for row in rows:
+        state = str(row["status"]).replace("lan_", "REMOTE ").upper()
+        lines.append(f"#{row['id']} · {state} · {float(row['progress'] or 0):.1f}%")
+        lines.append(f"{row['strategy_name']} · {row['filename']}")
+    if total > len(rows):
+        lines.append(f"…and {total - len(rows)} more")
+    return "\n".join(lines)
+
+
+def telegram_results_text() -> str:
+    with db() as connection:
+        total = int(connection.execute("SELECT COUNT(*) FROM results").fetchone()[0])
+        rows = connection.execute(
+            "SELECT essid,password,found_at FROM results ORDER BY id DESC LIMIT 8"
+        ).fetchall()
+    lines = [f"RECOVERED · {total}"]
+    if not rows:
+        lines.append("No recovered passwords yet.")
+    for row in rows:
+        lines.append(f"🔑 {row['essid']}  →  {row['password']}")
+    return "\n".join(lines)
+
+
+def telegram_help_text(file_intake: bool) -> str:
+    state = "enabled" if file_intake else "disabled in Settings"
+    return (
+        "HANDSHAKE LAB BOT\n"
+        "Use the buttons below to inspect and control the local recovery queue. W1–W4 changes the live GPU profile.\n\n"
+        "UPLOADS\n"
+        f"File intake is {state}. Send a file as a Telegram document (not as media). Supported captures: "
+        ".pcap, .pcapng, .cap, .22000 and .hc22000. Dictionaries and .rule files are also accepted. "
+        "Telegram Bot API downloads are limited to 20 MB. Captures are converted, validated and added to Captures; nothing starts automatically.\n\n"
+        "Commands: /start /status /queue /results /help"
+    )
+
+
+def telegram_render(token: str, chat_id: str, view: str = "status", message_id: int | None = None) -> None:
+    config = load_config()
+    texts = {
+        "status": telegram_status_text,
+        "queue": telegram_queue_text,
+        "results": telegram_results_text,
+        "help": lambda: telegram_help_text(bool(config.get("telegram_file_intake"))),
+        "upload": lambda: telegram_help_text(bool(config.get("telegram_file_intake"))),
+        "web": lambda: (
+            "WEB APP\nRemote Web is enabled, but Telegram requires a trusted HTTPS URL. "
+            "Set HTTPS public URL in Settings after configuring a domain, VPN HTTPS share or reverse proxy. "
+            "Handshake Lab will not present insecure HTTP as HTTPS."
+        ),
+    }
+    text = texts.get(view, telegram_status_text)()
+    telegram_send_message(token, chat_id, text, telegram_keyboard(config), message_id)
+
+
+def telegram_sync_bot_ui(token: str, chat_id: str, config: dict) -> None:
+    commands = [
+        {"command": "start", "description": "Open the Handshake Lab panel"},
+        {"command": "status", "description": "Show GPU and queue status"},
+        {"command": "queue", "description": "Show active and waiting jobs"},
+        {"command": "results", "description": "Show latest recovered passwords"},
+        {"command": "help", "description": "Uploads, controls and safety"},
+    ]
+    telegram_api(token, "setMyCommands", {"commands": json.dumps(commands)}, 12)
+    web_url = telegram_https_url(config)
+    menu_button: dict = {"type": "default"}
+    if web_url:
+        menu_button = {"type": "web_app", "text": "Open Handshake Lab", "web_app": {"url": web_url}}
+    telegram_api(token, "setChatMenuButton", {
+        "chat_id": chat_id, "menu_button": json.dumps(menu_button, ensure_ascii=False),
+    }, 12)
 
 
 def import_telegram_document(filename: str, content: bytes) -> tuple[int, dict]:
@@ -1283,6 +1464,7 @@ def import_telegram_document(filename: str, content: bytes) -> tuple[int, dict]:
 
 def telegram_file_intake_loop() -> None:
     offset = 0
+    synced_identity = ""
     try:
         if TELEGRAM_OFFSET_PATH.is_file():
             offset = int(TELEGRAM_OFFSET_PATH.read_text(encoding="ascii").strip() or 0)
@@ -1292,26 +1474,69 @@ def telegram_file_intake_loop() -> None:
         config = load_config()
         token = str(config.get("telegram_bot_token") or "").strip()
         allowed_chat = str(config.get("telegram_chat_id") or "").strip()
-        if not (config.get("notifications_telegram") and config.get("telegram_file_intake") and token and allowed_chat):
+        if not (config.get("notifications_telegram") and token and allowed_chat):
             TELEGRAM_INTAKE_STOP.wait(3)
             continue
         try:
-            updates = telegram_api(token, "getUpdates", {"offset": offset, "timeout": 15, "allowed_updates": json.dumps(["message"])}, 22)
+            identity = hashlib.sha256(f"{token}\0{allowed_chat}\0{telegram_https_url(config)}".encode("utf-8")).hexdigest()
+            if identity != synced_identity:
+                telegram_sync_bot_ui(token, allowed_chat, config)
+                synced_identity = identity
+            updates = telegram_api(
+                token, "getUpdates",
+                {"offset": offset, "timeout": 15, "allowed_updates": json.dumps(["message", "callback_query"])}, 22,
+            )
             for update in updates.get("result") or []:
                 offset = max(offset, int(update.get("update_id", 0)) + 1)
+                callback = update.get("callback_query") or {}
+                if callback:
+                    callback_message = callback.get("message") or {}
+                    chat_id = str((callback_message.get("chat") or {}).get("id") or "")
+                    if chat_id != allowed_chat:
+                        continue
+                    callback_id = str(callback.get("id") or "")
+                    if callback_id:
+                        telegram_api(token, "answerCallbackQuery", {"callback_query_id": callback_id}, 8)
+                    action = str(callback.get("data") or "").removeprefix("hl:")
+                    if action == "toggle":
+                        set_global_queue_paused(not bool(load_config().get("queue_paused")))
+                        action = "status"
+                    elif re.fullmatch(r"w[1-4]", action):
+                        set_global_workload(int(action[1]))
+                        action = "status"
+                    telegram_render(token, allowed_chat, action, int(callback_message.get("message_id") or 0) or None)
+                    continue
                 message = update.get("message") or {}
                 chat_id = str((message.get("chat") or {}).get("id") or "")
                 document = message.get("document") or {}
-                if chat_id != allowed_chat or not document:
+                if chat_id != allowed_chat:
+                    continue
+                text = str(message.get("text") or "").strip().split("@", 1)[0].lower()
+                if text.startswith("/") and not document:
+                    view = {
+                        "/start": "status", "/menu": "status", "/status": "status",
+                        "/queue": "queue", "/results": "results", "/help": "help",
+                    }.get(text, "help")
+                    telegram_render(token, allowed_chat, view)
+                    continue
+                if not document:
+                    telegram_render(token, allowed_chat, "help")
+                    continue
+                if not config.get("telegram_file_intake"):
+                    telegram_send_message(
+                        token, allowed_chat,
+                        "FILE INTAKE IS OFF\nEnable Telegram file intake in Settings and press Save changes before uploading.",
+                        telegram_keyboard(config),
+                    )
                     continue
                 filename = secure_filename(str(document.get("file_name") or "telegram-upload"))
                 suffix = Path(filename).suffix.lower()
                 if suffix not in ALLOWED_CAPTURES | ALLOWED_WORDLISTS | ALLOWED_RULES:
-                    send_telegram_notification(token, allowed_chat, "File rejected", "Use a capture, WPA 22000, dictionary or Hashcat .rule file.")
+                    telegram_send_message(token, allowed_chat, "FILE REJECTED\nUse .pcap, .pcapng, .cap, .22000, .hc22000, a dictionary or a Hashcat .rule file.", telegram_keyboard(config))
                     continue
                 size = int(document.get("file_size") or 0)
                 if size <= 0 or size > 20 * 1024 * 1024:
-                    send_telegram_notification(token, allowed_chat, "File rejected", "Telegram intake accepts files up to 20 MB.")
+                    telegram_send_message(token, allowed_chat, "FILE REJECTED\nTelegram intake accepts documents up to 20 MB.", telegram_keyboard(config))
                     continue
                 file_info = telegram_api(token, "getFile", {"file_id": document.get("file_id")}, 12).get("result") or {}
                 file_path = str(file_info.get("file_path") or "")
@@ -1325,9 +1550,12 @@ def telegram_file_intake_loop() -> None:
                 imported = result.get("imported") or []
                 errors = result.get("errors") or []
                 detail = f"Imported {len(imported)} item(s)."
+                if imported and suffix in ALLOWED_CAPTURES:
+                    item = imported[0]
+                    detail += f" {int(item.get('networks') or 0)} network(s), state: {item.get('status') or 'unknown'}."
                 if errors:
                     detail += " " + "; ".join(str(item) for item in errors[:3])
-                send_telegram_notification(token, allowed_chat, "Handshake Lab file intake", detail)
+                telegram_send_message(token, allowed_chat, f"UPLOAD COMPLETE\n{filename}\n{detail}", telegram_keyboard(config))
                 add_event("success" if status < 400 else "error", f"Telegram intake: {filename}: {detail}")
             temporary = TELEGRAM_OFFSET_PATH.with_suffix(".tmp")
             temporary.write_text(str(offset), encoding="ascii")
@@ -2556,7 +2784,11 @@ def remote_credentials_valid() -> bool:
 
 @app.before_request
 def protect_public_web_access():
-    if private_client(request.remote_addr) or request.path.startswith("/api/lan/") or request.path == "/health":
+    forwarded = ""
+    if private_client(request.remote_addr):
+        forwarded = str(request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+    effective_client = forwarded or request.remote_addr
+    if private_client(effective_client) or request.path.startswith("/api/lan/") or request.path == "/health":
         return None
     config = load_config()
     if not config.get("remote_access_enabled") or not remote_credentials_valid():
@@ -2946,28 +3178,27 @@ def create_queue():
 
 @app.post("/api/queue/pause-all")
 def pause_all_jobs():
+    return jsonify(set_global_queue_paused(True))
+
+
+def set_global_queue_paused(paused: bool) -> dict:
     with CONFIG_LOCK:
         current = load_config()
-        current["queue_paused"] = True
+        current["queue_paused"] = paused
         atomic_json(CONFIG_PATH, current)
-    paused = runner.pause_all()
+    jobs = runner.pause_all() if paused else runner.resume_all()
     with db() as connection:
-        connection.execute("UPDATE jobs SET status='lan_paused',remote_command='pause' WHERE status='lan_running'")
-    add_event("info", f"GPU queue paused{f': job {paused[0]}' if paused else ''}")
-    return jsonify({"ok": True, "queue_paused": True, "paused_jobs": paused})
+        if paused:
+            connection.execute("UPDATE jobs SET status='lan_paused',remote_command='pause' WHERE status='lan_running'")
+        else:
+            connection.execute("UPDATE jobs SET status='lan_running',remote_command='resume' WHERE status='lan_paused'")
+    add_event("info", f"GPU queue {'paused' if paused else 'resumed'}")
+    return {"ok": True, "queue_paused": paused, "paused_jobs" if paused else "resumed_jobs": jobs}
 
 
 @app.post("/api/queue/resume-all")
 def resume_all_jobs():
-    with CONFIG_LOCK:
-        current = load_config()
-        current["queue_paused"] = False
-        atomic_json(CONFIG_PATH, current)
-    resumed = runner.resume_all()
-    with db() as connection:
-        connection.execute("UPDATE jobs SET status='lan_running',remote_command='resume' WHERE status='lan_paused'")
-    add_event("info", "GPU queue resumed")
-    return jsonify({"ok": True, "queue_paused": False, "resumed_jobs": resumed})
+    return jsonify(set_global_queue_paused(False))
 
 
 @app.post("/api/queue/local/<action>")
@@ -2988,6 +3219,11 @@ def control_local_queue(action: str):
 def update_queue_workload():
     payload = request.get_json(force=True)
     workload = max(1, min(int(payload.get("workload", 3)), 4))
+    return jsonify(set_global_workload(workload))
+
+
+def set_global_workload(workload: int) -> dict:
+    workload = max(1, min(int(workload), 4))
     with CONFIG_LOCK:
         current = load_config()
         current["workload_profile"] = workload
@@ -2999,8 +3235,8 @@ def update_queue_workload():
         ).rowcount
     live_jobs = runner.set_live_workload(workload)
     add_event("info", f"Live GPU profile changed instantly to W{workload} for {len(live_jobs)} active job(s)")
-    return jsonify({"ok": True, "workload": workload, "updated_jobs": changed, "live_jobs": live_jobs,
-                    "restarting_jobs": []})
+    return {"ok": True, "workload": workload, "updated_jobs": changed, "live_jobs": live_jobs,
+            "restarting_jobs": []}
 
 
 @app.put("/api/queue/cpu-profile")
@@ -3585,6 +3821,11 @@ def save_config():
         current["telegram_file_intake"] = bool(current.get("telegram_file_intake", False))
         current["remote_access_enabled"] = bool(current.get("remote_access_enabled", False))
         current["remote_username"] = re.sub(r"[^0-9A-Za-z_.-]", "", str(current.get("remote_username") or "newfpv"))[:64] or "newfpv"
+        current["remote_https_url"] = str(current.get("remote_https_url") or "").strip().rstrip("/")
+        if current["remote_https_url"]:
+            parsed_https = urllib.parse.urlsplit(current["remote_https_url"])
+            if parsed_https.scheme != "https" or not parsed_https.hostname or parsed_https.username or parsed_https.password:
+                return jsonify({"error": "Telegram Web App URL must be a valid HTTPS address without embedded credentials"}), 400
         remote_password = str(payload.get("remote_password") or "")
         if remote_password:
             if len(remote_password) < 12:
@@ -3618,7 +3859,7 @@ def test_notification():
             chat_id = str(config.get("telegram_chat_id") or "").strip()
             if not token or not chat_id:
                 return jsonify({"error": "Enter both Telegram bot token and chat ID first"}), 400
-            send_telegram_notification(token, chat_id, "Handshake Lab test", "Telegram notifications are configured correctly.")
+            telegram_render(token, chat_id, "status")
             sent.append("telegram")
         if channel not in {"windows", "telegram", "all"}:
             return jsonify({"error": "Unsupported notification channel"}), 400
@@ -3645,7 +3886,8 @@ def remote_access_status():
         "password_configured": bool(config.get("remote_password_hash")),
         "listening_publicly": str(config.get("host")) in {"0.0.0.0", "::"},
         "public_ip": public_ip,
-        "url": f"http://{public_ip}:{port}" if public_ip else "",
+        "url": str(config.get("remote_https_url") or "") or (f"http://{public_ip}:{port}" if public_ip else ""),
+        "https_url": telegram_https_url(config),
         "error": error,
         "requires_router_forward": True,
         "tls_recommended": True,
