@@ -2,6 +2,12 @@
 
 All notable changes to NewFPV Handshake Lab are documented here.
 
+## 1.2.1 — 2026-07-20
+
+- Added a registered native Windows notification identity with a compact Handshake Lab logo.
+- Replaced the temporary tray balloon fallback with branded Windows Runtime toasts.
+- Expanded the README for live profiles, benchmarking, notifications, Telegram intake and authenticated remote access.
+
 ## 1.2.0 — 2026-07-20
 
 - Replaced checkpoint-based W1–W4 changes with immediate live GPU duty-cycle profiles that preserve the exact running process and position.

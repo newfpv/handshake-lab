@@ -1,6 +1,6 @@
 # Handshake Lab
 
-![Release](https://img.shields.io/badge/release-1.2.0-20e4f4?style=flat-square)
+![Release](https://img.shields.io/badge/release-1.2.1-20e4f4?style=flat-square)
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-20e4f4?style=flat-square)
 ![Local first](https://img.shields.io/badge/data-local%20only-30e37b?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-f4f6f7?style=flat-square)
@@ -21,7 +21,8 @@ A local-first control room for authorized WPA/WPA2 credential audits. Import cap
 - **One-click Error Doctor.** Recognize missing tools/files, CUDA RTC, VRAM, OpenCL and damaged capture failures with safe fixes.
 - **Real observability.** Speed, ETA, GPU load, temperature, VRAM, power, clock and fan history.
 - **Instant live GPU profiles.** Switch W1–W4 without restarting Hashcat or losing the current candidate position.
-- **Useful notifications.** Optional Windows and Telegram alerts for recovered keys, heat, worker failures and completed queues.
+- **Built-in benchmark.** Measure WPA 22000 performance in an exclusive W4 run and keep the latest result for comparison.
+- **Useful notifications.** Native Handshake Lab Windows toasts and optional Telegram alerts for recovered keys, heat, worker failures and completed queues.
 - **Controlled remote intake.** An approved Telegram chat can import small captures and candidate files; authenticated public-IP web access is opt-in.
 - **Two-PC mode.** Authenticated LAN workers use separate queues, telemetry, pause controls and power profiles.
 - **Crash-aware storage.** SQLite WAL/FULL writes, flushed result exports, Hashcat restore sessions and portable backups.
@@ -61,6 +62,33 @@ The browser opens at [http://127.0.0.1:8787](http://127.0.0.1:8787). Later launc
 
 The app excludes captures whose networks already have verified passwords and remembers unsuccessful source/method fingerprints so unchanged work can be skipped safely.
 
+## Live controls, notifications and remote access
+
+### Instant W1–W4 profiles
+
+Change the local GPU profile from **GPU queue** while a job is running. Handshake Lab changes the duty cycle of the existing Hashcat process, so the PID, restore session and exact candidate position remain intact. LAN workers receive live GPU-profile changes through their control channel. CPU-device changes apply to the next job because Hashcat cannot safely add or remove a backend device mid-session.
+
+Use **Pause all** as the master switch, or pause each online computer independently. Offline LAN workers and their telemetry are hidden from the dashboard and queue.
+
+### Benchmark and alerts
+
+Open **Settings → Audit engine → Benchmark** to run an exclusive Hashcat mode 22000 benchmark. The queue is held for the measurement and returns to its previous pause state afterwards.
+
+Windows notifications are local native toasts with the Handshake Lab identity and logo. Telegram is disabled until a bot token and chat ID are saved. **Test alerts** verifies every enabled channel; individual Windows and Telegram test buttons are available beside their settings.
+
+Telegram file intake is separately opt-in. When enabled, the exact configured chat may send captures, dictionaries and `.rule` files up to 20 MB. Files pass through the normal validation and deduplication flow and are never queued automatically.
+
+### Public-IP web access
+
+Remote access is private and disabled by default. In **Settings → Public-IP access**:
+
+1. Set a username and a new password of at least 12 characters.
+2. Enable remote access, save, and restart Handshake Lab if the listener changed.
+3. Press **Check address** to detect the external address.
+4. Forward TCP port `8787` on the router to the coordinator only when direct access is required.
+
+Public clients must authenticate with HTTP Basic and cross-origin write requests are rejected. Basic authentication does not encrypt traffic, so use an HTTPS reverse proxy or a private VPN for access outside a trusted network. Handshake Lab never enables UPnP or changes the router automatically.
+
 ## Requirements
 
 - Windows 10 or Windows 11 x64
@@ -81,7 +109,10 @@ The exhaustive documentation lives inside the app under **Help & Wiki**. It is s
 - overnight queues, checkpoints, timing and GPU/CPU profiles;
 - local files, backups, restores and PWMenu-compatible `recovered.csv` exports;
 - complete two-computer LAN setup;
-- Error Doctor, Windows/Telegram notifications and troubleshooting with exact failure meanings.
+- live W1–W4 behavior and the exclusive WPA benchmark;
+- native Windows alerts, Telegram file intake and notification testing;
+- authenticated public-IP access, HTTPS/VPN guidance and troubleshooting;
+- Error Doctor diagnostics with exact failure meanings.
 
 README stays intentionally short so installation is obvious; the built-in Wiki is the authoritative operating manual and is available offline.
 

@@ -1213,22 +1213,33 @@ def add_event(level: str, message: str) -> None:
 def send_windows_notification(title: str, message: str) -> None:
     if os.name != "nt":
         return
-    safe_title = html.escape(title, quote=True)
-    safe_message = html.escape(message, quote=True)
+    import base64
+    app_id = "NewFPV.HandshakeLab"
+    logo_path = (ROOT / "static" / "handshake-lab-logo.svg").resolve()
+    logo_uri = logo_path.as_uri()
     xml = (
-        "<toast><visual><binding template='ToastGeneric'>"
-        f"<text>{safe_title}</text><text>{safe_message}</text>"
+        "<toast duration='short'><visual><binding template='ToastGeneric'>"
+        f"<text>{html.escape(title)}</text><text>{html.escape(message)}</text>"
+        f"<image placement='appLogoOverride' src='{html.escape(logo_uri, quote=True)}'/>"
         "</binding></visual></toast>"
     )
-    import base64
     xml_encoded = base64.b64encode(xml.encode("utf-8")).decode("ascii")
+    logo_encoded = base64.b64encode(str(logo_path).encode("utf-8")).decode("ascii")
     script = (
+        f"$appId='{app_id}';$appKey='HKCU:\\Software\\Classes\\AppUserModelId\\'+$appId;"
+        f"$icon=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{logo_encoded}'));"
+        "New-Item -Path $appKey -Force|Out-Null;"
+        "New-ItemProperty -Path $appKey -Name DisplayName -Value 'Handshake Lab' -PropertyType String -Force|Out-Null;"
+        "New-ItemProperty -Path $appKey -Name IconUri -Value $icon -PropertyType String -Force|Out-Null;"
+        "New-ItemProperty -Path $appKey -Name IconBackgroundColor -Value '#07090a' -PropertyType String -Force|Out-Null;"
+        "New-ItemProperty -Path $appKey -Name ShowInSettings -Value 1 -PropertyType DWord -Force|Out-Null;"
         "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]>$null;"
         "[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime]>$null;"
-        f"$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{xml_encoded}'));"
-        "$x=New-Object Windows.Data.Xml.Dom.XmlDocument;$x.LoadXml($s);"
-        "$t=[Windows.UI.Notifications.ToastNotification]::new($x);"
-        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Handshake Lab').Show($t)"
+        f"$payload=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{xml_encoded}'));"
+        "$document=New-Object Windows.Data.Xml.Dom.XmlDocument;$document.LoadXml($payload);"
+        "$toast=[Windows.UI.Notifications.ToastNotification]::new($document);$null=$toast.add_Activated({});"
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast);"
+        "Start-Sleep -Milliseconds 2000"
     )
     encoded = script.encode("utf-16le")
     completed = subprocess.run(
@@ -1349,8 +1360,8 @@ def notify_user(kind: str, title: str, message: str, cooldown_key: str = "", coo
         if config.get("notifications_windows", True):
             try:
                 send_windows_notification(title, message)
-            except Exception:
-                pass
+            except Exception as exc:
+                add_event("error", f"Windows notification failed: {str(exc)[:240]}")
         if config.get("notifications_telegram", False):
             token = str(config.get("telegram_bot_token") or "").strip()
             chat_id = str(config.get("telegram_chat_id") or "").strip()
@@ -3600,7 +3611,7 @@ def test_notification():
                 if channel == "windows":
                     return jsonify({"error": "Windows notifications are available only on Windows"}), 400
             else:
-                send_windows_notification("Handshake Lab test", "Windows notifications are configured correctly.")
+                send_windows_notification("Test notification", "Windows notifications are configured correctly.")
                 sent.append("windows")
         if channel in {"telegram", "all"} and config.get("notifications_telegram", False):
             token = str(config.get("telegram_bot_token") or "").strip()
